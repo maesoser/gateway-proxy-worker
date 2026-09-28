@@ -45,9 +45,12 @@ interface Env {
   VPC: VpcNetworkBinding;
   SOCKS5_HOST: string;
   SOCKS5_PORT: string;
-  /** RFC 1929 credentials for the SOCKS5 proxy (stored as secrets) */
-  SOCKS5_USERNAME: string;
-  SOCKS5_PASSWORD: string;
+  /**
+   * RFC 1929 credentials for the SOCKS5 proxy.
+   * Optional — if either is absent the Worker connects unauthenticated (method 0x00).
+   */
+  SOCKS5_USERNAME?: string;
+  SOCKS5_PASSWORD?: string;
   /** Set to "true" to enable verbose debug logging via wrangler tail */
   DEBUG: string;
 }
@@ -163,17 +166,20 @@ async function socks5Connect(
   writer: WritableStreamDefaultWriter<Uint8Array>,
   targetHost: string,
   targetPort: number,
-  username: string,
-  password: string,
+  username: string | undefined,
+  password: string | undefined,
   log: Logger
 ): Promise<void> {
   const enc = new TextEncoder();
+  const hasCredentials = Boolean(username && password);
 
   // ── Step 1: Client greeting ──────────────────────────────────────────────
-  // Advertise both no-auth and username/password so the proxy can pick.
-  // VER | NMETHODS | METHOD[0] | METHOD[1]
-  const greeting = new Uint8Array([SOCKS_VERSION, 0x02, METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD]);
-  log.debug(`SOCKS5 greeting → ${hex(greeting)}`);
+  // Advertise only the methods we can actually satisfy.
+  // VER | NMETHODS | METHOD...
+  const greeting = hasCredentials
+    ? new Uint8Array([SOCKS_VERSION, 0x02, METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD])
+    : new Uint8Array([SOCKS_VERSION, 0x01, METHOD_NO_AUTH]);
+  log.debug(`SOCKS5 greeting → ${hex(greeting)} (${hasCredentials ? "no-auth + user/pass" : "no-auth only"})`);
   await writer.write(greeting);
 
   // ── Step 2: Server method selection ──────────────────────────────────────
@@ -190,6 +196,9 @@ async function socks5Connect(
 
   // ── Step 3 (conditional): RFC 1929 username/password sub-negotiation ─────
   if (methodResponse[1] === METHOD_USERNAME_PASSWORD) {
+    if (!hasCredentials) {
+      throw new Error("SOCKS5: server requires authentication but no credentials are configured");
+    }
     log.debug("SOCKS5 server selected username/password auth (0x02)");
 
     const uBytes = enc.encode(username);
@@ -442,6 +451,7 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
 
     try {
       // Perform the SOCKS5 CONNECT handshake to establish the tunnel.
+      // Credentials are optional — if absent the proxy is contacted unauthenticated.
       await socks5Connect(reader, writer, targetHost, targetPort, env.SOCKS5_USERNAME, env.SOCKS5_PASSWORD, log);
 
       // Serialise and send the HTTP request into the tunnel.

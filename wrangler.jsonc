@@ -20,10 +20,11 @@
     "DEBUG": "true"
   },
 
-  // SOCKS5_USERNAME and SOCKS5_PASSWORD are stored as encrypted secrets.
-  // Set them with:
-  //   wrangler secret put SOCKS5_USERNAME
-  //   wrangler secret put SOCKS5_PASSWORD
+  // SOCKS5_USERNAME and SOCKS5_PASSWORD are optional secrets.
+  // If set, the Worker authenticates with the proxy using RFC 1929 user/pass.
+  // If absent, the Worker connects unauthenticated (SOCKS5 method 0x00).
+  // To add auth:   wrangler secret put SOCKS5_USERNAME && wrangler secret put SOCKS5_PASSWORD && wrangler deploy
+  // To remove auth: wrangler secret delete SOCKS5_USERNAME && wrangler secret delete SOCKS5_PASSWORD && wrangler deploy
 
   "observability": {
     "enabled": true
