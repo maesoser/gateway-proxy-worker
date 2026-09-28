@@ -13,18 +13,17 @@
     }
   ],
 
-  // SOCKS5 proxy address reachable behind the tunnel
+  // HTTP proxy address reachable behind the tunnel
   "vars": {
-    "SOCKS5_HOST": "172.18.0.21",
-    "SOCKS5_PORT": "1080",
+    "PROXY_HOST": "172.18.0.21",
+    "PROXY_PORT": "8080",
     "DEBUG": "true"
   },
 
-  // SOCKS5_USERNAME and SOCKS5_PASSWORD are optional secrets.
-  // If set, the Worker authenticates with the proxy using RFC 1929 user/pass.
-  // If absent, the Worker connects unauthenticated (SOCKS5 method 0x00).
-  // To add auth:   wrangler secret put SOCKS5_USERNAME && wrangler secret put SOCKS5_PASSWORD && wrangler deploy
-  // To remove auth: wrangler secret delete SOCKS5_USERNAME && wrangler secret delete SOCKS5_PASSWORD && wrangler deploy
+  // PROXY_USERNAME and PROXY_PASSWORD are optional secrets.
+  // If set, a Proxy-Authorization: Basic header is added to every request.
+  // To add auth:    wrangler secret put PROXY_USERNAME && wrangler secret put PROXY_PASSWORD && wrangler deploy
+  // To remove auth: wrangler secret delete PROXY_USERNAME && wrangler secret delete PROXY_PASSWORD && wrangler deploy
 
   "observability": {
     "enabled": true

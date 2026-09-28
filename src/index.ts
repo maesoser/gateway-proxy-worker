@@ -2,20 +2,27 @@
  * workers-proxy
  *
  * A Cloudflare Gateway middleware Worker that acts as a forward HTTP proxy by
- * tunneling every request through a SOCKS5 proxy on a private network,
+ * tunneling every request through an HTTP proxy on a private network,
  * reachable via a Workers VPC Network binding over a Cloudflare Tunnel.
  *
  * It is deployed as a Gateway Custom Action (Programmable Gateway / Gateway
  * Workers). Gateway matches HTTP policy rules, decrypts TLS, and dispatches
  * the plain Request to this Worker's GatewayMiddleware.handle() method.
- * The Worker tunnels the request through SOCKS5 and returns the response;
- * Gateway forwards that response back to the client.
+ *
+ * Protocol:
+ *   HTTP  → PROXY sends  "GET http://host/path HTTP/1.1"  (absolute-form)
+ *           The HTTP proxy forwards the request to the origin directly.
+ *
+ *   HTTPS → Worker sends "CONNECT host:443 HTTP/1.1" to the proxy.
+ *           Proxy replies "200 Connection established".
+ *           Worker then sends plain HTTP through the transparent tunnel.
+ *           The proxy handles TLS to the origin — the Worker never sees it.
  *
  * Flow:
  *   Client → Cloudflare Gateway (TLS termination + policy match)
  *     → GatewayMiddleware.handle(request, context, next)
  *       → VPC connect() → Cloudflare Tunnel (mad01-k8s)
- *         → SOCKS5 proxy (172.18.0.21:1080) → Target origin
+ *         → HTTP proxy (172.18.0.21:8080) → Target origin
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -43,14 +50,16 @@ interface VpcNetworkBinding {
 interface Env {
   /** VPC Network binding that routes TCP through the mad01-k8s tunnel */
   VPC: VpcNetworkBinding;
-  SOCKS5_HOST: string;
-  SOCKS5_PORT: string;
+  /** Hostname or IP of the HTTP proxy reachable behind the tunnel */
+  PROXY_HOST: string;
+  /** Port the HTTP proxy listens on */
+  PROXY_PORT: string;
   /**
-   * RFC 1929 credentials for the SOCKS5 proxy.
-   * Optional — if either is absent the Worker connects unauthenticated (method 0x00).
+   * Optional HTTP proxy credentials (Proxy-Authorization: Basic ...).
+   * If either is absent the request is sent without a Proxy-Authorization header.
    */
-  SOCKS5_USERNAME?: string;
-  SOCKS5_PASSWORD?: string;
+  PROXY_USERNAME?: string;
+  PROXY_PASSWORD?: string;
   /** Set to "true" to enable verbose debug logging via wrangler tail */
   DEBUG: string;
 }
@@ -90,56 +99,29 @@ function newRequestId(): string {
 }
 
 // ---------------------------------------------------------------------------
-// SOCKS5 constants (RFC 1928 + RFC 1929)
-// ---------------------------------------------------------------------------
-
-const SOCKS_VERSION = 0x05;
-
-// Authentication methods
-const METHOD_NO_AUTH = 0x00;
-const METHOD_USERNAME_PASSWORD = 0x02;
-const METHOD_NO_ACCEPTABLE = 0xff;
-
-// RFC 1929 username/password sub-negotiation version
-const USERPASS_VERSION = 0x01;
-
-// Commands
-const CMD_CONNECT = 0x01;
-
-// Address types
-const ATYP_IPV4 = 0x01;
-const ATYP_DOMAINNAME = 0x03;
-const ATYP_IPV6 = 0x04;
-
-// Reply codes
-const REP_SUCCESS = 0x00;
-
-// ---------------------------------------------------------------------------
 // Low-level helpers
 // ---------------------------------------------------------------------------
 
 /**
  * Stateful buffered reader that wraps a ReadableStreamDefaultReader.
  *
- * go-socks5 (and many other proxies) write the entire CONNECT reply — header
- * + BND address — in a single TCP segment, which the Workers runtime delivers
- * as one chunk. A naïve readExactly that reads N bytes and discards the rest
- * of the chunk will lose the bytes that belong to the next read.
+ * HTTP proxies write the CONNECT response header and may include bytes of the
+ * tunneled response in the same TCP segment. A naïve readUntil that discards
+ * leftover bytes from an oversized chunk would lose those bytes.
  *
- * BufferedReader keeps an internal remainder buffer so that leftover bytes
- * from an oversized chunk are preserved and returned by the next readExactly
- * call.
+ * BufferedReader keeps an internal remainder buffer so leftover bytes from
+ * one read are preserved and returned by the next call.
  */
 class BufferedReader {
   private remainder: Uint8Array = new Uint8Array(0);
 
   constructor(private inner: ReadableStreamDefaultReader<Uint8Array>) {}
 
+  /** Read exactly n bytes, preserving any excess in the remainder buffer. */
   async readExactly(n: number): Promise<Uint8Array> {
     const out = new Uint8Array(n);
     let offset = 0;
 
-    // Drain the remainder buffer first.
     if (this.remainder.length > 0) {
       const take = Math.min(this.remainder.length, n);
       out.set(this.remainder.subarray(0, take), 0);
@@ -147,20 +129,17 @@ class BufferedReader {
       this.remainder = this.remainder.subarray(take);
     }
 
-    // Pull new chunks until we have exactly n bytes.
     while (offset < n) {
       const { done, value } = await this.inner.read();
-      if (done) throw new Error(`SOCKS5: stream ended after ${offset}/${n} bytes`);
+      if (done) throw new Error(`Proxy: stream ended after ${offset}/${n} bytes`);
       const chunk = value as Uint8Array;
       const needed = n - offset;
       if (chunk.length <= needed) {
         out.set(chunk, offset);
         offset += chunk.length;
       } else {
-        // Chunk is larger than needed: take what we need, keep the rest.
         out.set(chunk.subarray(0, needed), offset);
         offset += needed;
-        // Preserve leftover bytes for the next readExactly call.
         this.remainder = chunk.subarray(needed);
       }
     }
@@ -169,18 +148,39 @@ class BufferedReader {
   }
 
   /**
-   * Wrap the remaining unread bytes (in the internal buffer) together with
-   * the underlying reader back into a ReadableStream, for handing off to the
-   * HTTP response parser after the SOCKS5 handshake is complete.
+   * Read bytes until the delimiter sequence is found, returning everything
+   * up to and including the delimiter. Excess bytes are kept in remainder.
+   */
+  async readUntil(delimiter: Uint8Array): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = this.remainder.length > 0
+      ? [this.remainder]
+      : [];
+    this.remainder = new Uint8Array(0);
+
+    while (true) {
+      const combined = concat(chunks);
+      const idx = indexOfSequence(combined, delimiter);
+      if (idx !== -1) {
+        const end = idx + delimiter.length;
+        this.remainder = combined.subarray(end);
+        return combined.subarray(0, end);
+      }
+      const { done, value } = await this.inner.read();
+      if (done) throw new Error("Proxy: stream ended before delimiter found");
+      chunks.push(value as Uint8Array);
+    }
+  }
+
+  /**
+   * Convert the remaining unread data + underlying reader back into a
+   * ReadableStream, for handing off to the HTTP response parser.
    */
   toReadableStream(): ReadableStream<Uint8Array> {
     const remainder = this.remainder;
     const inner = this.inner;
     return new ReadableStream<Uint8Array>({
       async start(controller) {
-        if (remainder.length > 0) {
-          controller.enqueue(remainder);
-        }
+        if (remainder.length > 0) controller.enqueue(remainder);
       },
       async pull(controller) {
         const { done, value } = await inner.read();
@@ -190,162 +190,63 @@ class BufferedReader {
           controller.enqueue(value as Uint8Array);
         }
       },
-      cancel() {
-        inner.cancel();
-      },
+      cancel() { inner.cancel(); },
     });
   }
 
-  cancel(): void {
-    this.inner.cancel();
-  }
-}
-
-/** Format a Uint8Array as a hex string for debug output. */
-function hex(bytes: Uint8Array): string {
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join(" ");
+  cancel(): void { this.inner.cancel(); }
 }
 
 // ---------------------------------------------------------------------------
-// SOCKS5 handshake
+// HTTP proxy handshake
 // ---------------------------------------------------------------------------
 
 /**
- * Performs the full SOCKS5 CONNECT handshake with RFC 1929 username/password
- * authentication and returns once the tunnel is established.
- *
- * After this function returns successfully, the socket is a transparent
- * byte pipe to `targetHost:targetPort`.
+ * Send HTTP CONNECT to the proxy and wait for "200 Connection established".
+ * After this returns the socket is a transparent byte pipe to targetHost:targetPort.
  */
-async function socks5Connect(
+async function httpProxyConnect(
   reader: BufferedReader,
   writer: WritableStreamDefaultWriter<Uint8Array>,
   targetHost: string,
   targetPort: number,
-  username: string | undefined,
-  password: string | undefined,
+  proxyAuth: string | null,
   log: Logger
 ): Promise<void> {
   const enc = new TextEncoder();
-  const hasCredentials = Boolean(username && password);
 
-  // ── Step 1: Client greeting ──────────────────────────────────────────────
-  // Advertise only the methods we can actually satisfy.
-  // VER | NMETHODS | METHOD...
-  const greeting = hasCredentials
-    ? new Uint8Array([SOCKS_VERSION, 0x02, METHOD_NO_AUTH, METHOD_USERNAME_PASSWORD])
-    : new Uint8Array([SOCKS_VERSION, 0x01, METHOD_NO_AUTH]);
-  log.debug(`SOCKS5 greeting → ${hex(greeting)} (${hasCredentials ? "no-auth + user/pass" : "no-auth only"})`);
-  await writer.write(greeting);
+  const lines = [
+    `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
+    `Host: ${targetHost}:${targetPort}`,
+  ];
+  if (proxyAuth) lines.push(`Proxy-Authorization: Basic ${proxyAuth}`);
+  lines.push("", ""); // blank line terminating headers
 
-  // ── Step 2: Server method selection ──────────────────────────────────────
-  // VER | METHOD
-  const methodResponse = await reader.readExactly(2);
-  log.debug(`SOCKS5 method selection ← ${hex(methodResponse)}`);
+  const request = enc.encode(lines.join("\r\n"));
+  log.debug(`HTTP CONNECT → ${targetHost}:${targetPort}`);
+  await writer.write(request);
 
-  if (methodResponse[0] !== SOCKS_VERSION) {
-    throw new Error(`SOCKS5: unexpected version byte ${methodResponse[0]}`);
+  // Read the proxy response up to and including the blank line.
+  const CRLF2 = enc.encode("\r\n\r\n");
+  const responseBytes = await reader.readUntil(CRLF2);
+  const responseText = new TextDecoder("latin1").decode(responseBytes);
+  log.debug(`HTTP CONNECT response ←\n${responseText.trimEnd()}`);
+
+  // Expect HTTP/1.x 200 ...
+  const statusMatch = responseText.match(/^HTTP\/1\.[01] (\d{3})/);
+  if (!statusMatch) {
+    throw new Error(`Proxy: unrecognised CONNECT response: ${responseText.split("\r\n")[0]}`);
   }
-  if (methodResponse[1] === METHOD_NO_ACCEPTABLE) {
-    throw new Error("SOCKS5: server returned no acceptable auth method");
-  }
-
-  // ── Step 3 (conditional): RFC 1929 username/password sub-negotiation ─────
-  if (methodResponse[1] === METHOD_USERNAME_PASSWORD) {
-    if (!hasCredentials) {
-      throw new Error("SOCKS5: server requires authentication but no credentials are configured");
-    }
-    log.debug("SOCKS5 server selected username/password auth (0x02)");
-
-    const uBytes = enc.encode(username);
-    const pBytes = enc.encode(password);
-
-    if (uBytes.length > 255) throw new Error("SOCKS5: username too long (max 255 bytes)");
-    if (pBytes.length > 255) throw new Error("SOCKS5: password too long (max 255 bytes)");
-
-    // VER(1) | ULEN(1) | UNAME(uLen) | PLEN(1) | PASSWD(pLen)
-    const authMsg = new Uint8Array(1 + 1 + uBytes.length + 1 + pBytes.length);
-    let i = 0;
-    authMsg[i++] = USERPASS_VERSION;
-    authMsg[i++] = uBytes.length;
-    authMsg.set(uBytes, i); i += uBytes.length;
-    authMsg[i++] = pBytes.length;
-    authMsg.set(pBytes, i);
-
-    // Log auth frame without leaking credentials — show structure only.
-    log.debug(`SOCKS5 auth sub-negotiation → VER=0x01 ULEN=${uBytes.length} PLEN=${pBytes.length}`);
-    await writer.write(authMsg);
-
-    // Server auth reply: VER(1) | STATUS(1) — 0x00 means success
-    const authReply = await reader.readExactly(2);
-    log.debug(`SOCKS5 auth reply ← ${hex(authReply)}`);
-
-    if (authReply[1] !== 0x00) {
-      throw new Error(`SOCKS5: authentication failed (status 0x${authReply[1].toString(16)})`);
-    }
-    log.debug("SOCKS5 authentication succeeded");
-  } else if (methodResponse[1] === METHOD_NO_AUTH) {
-    log.debug("SOCKS5 server selected no-auth (0x00)");
-  } else {
-    throw new Error(`SOCKS5: unsupported auth method 0x${methodResponse[1].toString(16)}`);
+  const status = parseInt(statusMatch[1], 10);
+  if (status !== 200) {
+    throw new Error(`Proxy: CONNECT failed with status ${status}: ${responseText.split("\r\n")[0]}`);
   }
 
-  // ── Step 4: CONNECT request ───────────────────────────────────────────────
-  // VER | CMD | RSV | ATYP | DST.ADDR | DST.PORT
-  const hostBytes = enc.encode(targetHost);
-  const hostLen = hostBytes.length;
-  if (hostLen > 255) {
-    throw new Error(`SOCKS5: hostname too long (${hostLen} bytes, max 255)`);
-  }
-
-  // We always send the hostname as a domain name (ATYP_DOMAINNAME).
-  // The SOCKS5 proxy resolves it, which is the desired behaviour.
-  const connectReq = new Uint8Array(4 + 1 + hostLen + 2);
-  connectReq[0] = SOCKS_VERSION;
-  connectReq[1] = CMD_CONNECT;
-  connectReq[2] = 0x00; // RSV
-  connectReq[3] = ATYP_DOMAINNAME;
-  connectReq[4] = hostLen;
-  connectReq.set(hostBytes, 5);
-  connectReq[5 + hostLen] = (targetPort >> 8) & 0xff;
-  connectReq[6 + hostLen] = targetPort & 0xff;
-
-  log.debug(`SOCKS5 CONNECT → ${targetHost}:${targetPort} (${hex(connectReq)})`);
-  await writer.write(connectReq);
-
-  // ── Step 5: Server reply ─────────────────────────────────────────────────
-  // VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
-  const replyHeader = await reader.readExactly(4);
-  log.debug(`SOCKS5 CONNECT reply header ← ${hex(replyHeader)}`);
-
-  if (replyHeader[0] !== SOCKS_VERSION) {
-    throw new Error(`SOCKS5: unexpected version in reply ${replyHeader[0]}`);
-  }
-  if (replyHeader[1] !== REP_SUCCESS) {
-    throw new Error(`SOCKS5: CONNECT failed, REP=0x${replyHeader[1].toString(16)}`);
-  }
-
-  // Consume the BND.ADDR and BND.PORT fields (we don't use them).
-  const atyp = replyHeader[3];
-  if (atyp === ATYP_IPV4) {
-    const bnd = await reader.readExactly(4 + 2);
-    log.debug(`SOCKS5 BND.ADDR (IPv4) ← ${hex(bnd)}`);
-  } else if (atyp === ATYP_IPV6) {
-    const bnd = await reader.readExactly(16 + 2);
-    log.debug(`SOCKS5 BND.ADDR (IPv6) ← ${hex(bnd)}`);
-  } else if (atyp === ATYP_DOMAINNAME) {
-    const lenBuf = await reader.readExactly(1);
-    const bnd = await reader.readExactly(lenBuf[0] + 2);
-    log.debug(`SOCKS5 BND.ADDR (domain) ← ${hex(bnd)}`);
-  } else {
-    throw new Error(`SOCKS5: unknown ATYP in reply: 0x${atyp.toString(16)}`);
-  }
-
-  log.debug("SOCKS5 tunnel established");
+  log.debug("HTTP CONNECT tunnel established");
 }
 
 // ---------------------------------------------------------------------------
-// HTTP request serialisation
+// Header sets
 // ---------------------------------------------------------------------------
 
 /** Headers stripped from outgoing requests to the upstream. */
@@ -360,8 +261,8 @@ const HOP_BY_HOP = new Set([
   "transfer-encoding",
   "upgrade",
   // Gateway decrypts TLS and may decode the body before the Worker sees it.
-  // Forwarding accept-encoding would cause the origin to send a compressed
-  // body that the Worker (or the browser) then fails to decode correctly.
+  // Forwarding accept-encoding would cause the origin to compress the body
+  // and set Content-Encoding, which would then fail to decode in the browser.
   "accept-encoding",
 ]);
 
@@ -369,15 +270,13 @@ const HOP_BY_HOP = new Set([
  * Headers stripped from upstream responses before returning to the client.
  *
  * Gateway decrypts TLS and may decode compressed bodies before the Worker
- * receives them. If the origin's Content-Encoding header is forwarded
- * unchanged, the browser will try to decompress an already-decoded body and
- * produce ERR_CONTENT_DECODING_FAILED. Content-Length is also removed because
- * the decoded body length will differ from the originally compressed one.
+ * receives them. Forwarding Content-Encoding unchanged causes the browser to
+ * try to decompress an already-decoded body → ERR_CONTENT_DECODING_FAILED.
+ * Content-Length is removed because decoded length ≠ compressed length.
  */
 const STRIP_RESPONSE = new Set([
   "content-encoding",
   "content-length",
-  // Standard hop-by-hop headers that must not cross a proxy boundary.
   "connection",
   "keep-alive",
   "proxy-authenticate",
@@ -389,22 +288,34 @@ const STRIP_RESPONSE = new Set([
   "upgrade",
 ]);
 
+// ---------------------------------------------------------------------------
+// HTTP request serialisation
+// ---------------------------------------------------------------------------
+
 /**
- * Serialise the incoming Workers Request into a raw HTTP/1.1 request buffer
- * suitable for writing directly into the SOCKS5-tunneled TCP socket.
+ * Serialise the incoming Request into raw HTTP/1.1 bytes to write into the
+ * tunnel.
+ *
+ * For HTTP:  request-target is absolute-form (http://host/path) so the proxy
+ *            knows where to forward it.
+ * For HTTPS: request-target is origin-form (/path) because by this point a
+ *            CONNECT tunnel is established and the proxy is transparent.
  */
-async function buildHttpRequest(request: Request, url: URL, log: Logger): Promise<Uint8Array> {
+async function buildRawRequest(
+  request: Request,
+  url: URL,
+  useAbsoluteForm: boolean,
+  log: Logger
+): Promise<Uint8Array> {
   const method = request.method;
-  // For a forward proxy we send an absolute-form request-target OR
-  // origin-form depending on whether we want to let the upstream handle it.
-  // Most origin servers expect origin-form, so we use that.
-  const path = url.pathname + url.search || "/";
+  const target = useAbsoluteForm
+    ? url.toString()
+    : (url.pathname + url.search || "/");
 
   const lines: string[] = [];
-  lines.push(`${method} ${path} HTTP/1.1`);
+  lines.push(`${method} ${target} HTTP/1.1`);
   lines.push(`Host: ${url.hostname}${url.port ? ":" + url.port : ""}`);
 
-  // Forward safe headers from the incoming request.
   for (const [name, value] of request.headers) {
     if (HOP_BY_HOP.has(name.toLowerCase())) {
       log.debug(`Dropping hop-by-hop header: ${name}`);
@@ -413,18 +324,16 @@ async function buildHttpRequest(request: Request, url: URL, log: Logger): Promis
     lines.push(`${name}: ${value}`);
   }
 
-  lines.push("Connection: close"); // signal to origin we're done after one response
-  lines.push(""); // blank line
-  lines.push(""); // end of headers
+  lines.push("Connection: close");
+  lines.push("", "");
 
-  log.debug(`HTTP request headers:\n${lines.slice(0, -2).join("\r\n")}`);
+  log.debug(`Request line: ${lines[0]}`);
 
   const headerBytes = new TextEncoder().encode(lines.join("\r\n"));
 
-  // Append body if present
   if (request.body) {
     const bodyBytes = new Uint8Array(await request.arrayBuffer());
-    log.debug(`HTTP request body: ${bodyBytes.length} bytes`);
+    log.debug(`Request body: ${bodyBytes.length} bytes`);
     const combined = new Uint8Array(headerBytes.length + bodyBytes.length);
     combined.set(headerBytes, 0);
     combined.set(bodyBytes, headerBytes.length);
@@ -432,29 +341,6 @@ async function buildHttpRequest(request: Request, url: URL, log: Logger): Promis
   }
 
   return headerBytes;
-}
-
-/**
- * Build a fetch()-compatible Request from the incoming Gateway request.
- * Used for the HTTPS path where env.VPC.fetch() handles TLS natively.
- */
-function buildFetchRequest(request: Request, url: URL, log: Logger): Request {
-  const headers = new Headers();
-  for (const [name, value] of request.headers) {
-    if (HOP_BY_HOP.has(name.toLowerCase())) {
-      log.debug(`Dropping hop-by-hop header: ${name}`);
-      continue;
-    }
-    headers.set(name, value);
-  }
-
-  log.debug(`Fetch request headers: ${[...headers.entries()].map(([k, v]) => `${k}: ${v}`).join(", ")}`);
-
-  return new Request(url.toString(), {
-    method: request.method,
-    headers,
-    body: request.body,
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -468,22 +354,16 @@ function buildFetchRequest(request: Request, url: URL, log: Logger): Request {
  * not be renamed. Gateway invokes handle(request, context, next) for every
  * HTTP request that matches the associated policy rule.
  *
- * In this implementation next() is never called: the Worker is the egress
- * path itself — it opens a SOCKS5 tunnel through the VPC binding and forwards
- * the request there, replacing what next() would normally do.
- *
  * context carries Gateway request-phase selectors (src_ip, host, uri, etc.).
  */
 export class GatewayMiddleware extends WorkerEntrypoint<Env> {
   async handle(
     request: Request,
     context: Record<string, unknown>,
-    // next is provided by Gateway but not used here — this Worker is the egress.
+    // next is provided by Gateway but not used — this Worker is the egress.
     _next: (req: Request) => Promise<Response>
   ): Promise<Response> {
-    // env is available as this.env in WorkerEntrypoint subclasses.
     const env = this.env;
-
     const requestId = newRequestId();
     const log = makeLogger(env, requestId);
 
@@ -491,100 +371,71 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     log.debug(`Gateway context: ${JSON.stringify(context)}`);
 
     const url = new URL(request.url);
+    const isHttps = url.protocol === "https:";
+    const targetHost = url.hostname;
+    const defaultPort = isHttps ? 443 : 80;
+    const targetPort = url.port ? parseInt(url.port, 10) : defaultPort;
 
-    log.info(`${request.method} ${url.hostname}:${url.port || (url.protocol === "https:" ? 443 : 80)}`);
+    log.info(`${request.method} ${targetHost}:${targetPort}`);
     log.debug(`Full URL: ${url.toString()}`);
     log.debug(`Incoming headers: ${[...request.headers.entries()].map(([k, v]) => `${k}: ${v}`).join(", ")}`);
-
-    // Determine target host and port from the incoming request URL.
-    const targetHost = url.hostname;
-    const defaultPort = url.protocol === "https:" ? 443 : 80;
-    const targetPort = url.port ? parseInt(url.port, 10) : defaultPort;
 
     if (!targetHost) {
       log.error("Missing host in request URL");
       return new Response("Bad Request: missing host", { status: 400 });
     }
 
-    // ── HTTPS: use env.VPC.fetch() ──────────────────────────────────────────
-    // VPC Network connect() supports plaintext TCP only — startTls() is not
-    // available on VPC-bound sockets. For HTTPS targets we therefore use
-    // env.VPC.fetch(), which handles TLS natively and routes through the same
-    // Cloudflare Tunnel. The SOCKS5 raw-TCP path is kept for plain HTTP only.
-    if (url.protocol === "https:") {
-      log.debug("HTTPS request — forwarding via env.VPC.fetch()");
-      try {
-        const proxyReq = buildFetchRequest(request, url, log);
-        const upstreamRes = await env.VPC.fetch(proxyReq);
+    // Build Proxy-Authorization header value if credentials are configured.
+    const proxyAuth = (env.PROXY_USERNAME && env.PROXY_PASSWORD)
+      ? btoa(`${env.PROXY_USERNAME}:${env.PROXY_PASSWORD}`)
+      : null;
+    if (proxyAuth) log.debug("Proxy-Authorization header will be sent");
 
-        // Rebuild the response without content-encoding / content-length.
-        // The Workers runtime may have already decoded the body; forwarding
-        // those headers would cause ERR_CONTENT_DECODING_FAILED in the browser.
-        const resHeaders = new Headers();
-        for (const [name, value] of upstreamRes.headers) {
-          if (STRIP_RESPONSE.has(name.toLowerCase())) {
-            log.debug(`Dropping response header: ${name}`);
-            continue;
-          }
-          resHeaders.set(name, value);
-        }
-
-        const response = new Response(upstreamRes.body, {
-          status: upstreamRes.status,
-          statusText: upstreamRes.statusText,
-          headers: resHeaders,
-        });
-        log.info(`Response: ${response.status} ${response.statusText}`);
-        return response;
-      } catch (err) {
-        log.error(`VPC fetch failed: ${err}`);
-        return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
-      }
-    }
-
-    // ── HTTP: tunnel through SOCKS5 over raw TCP ────────────────────────────
-    log.debug(`HTTP request — connecting to SOCKS5 proxy at ${env.SOCKS5_HOST}:${env.SOCKS5_PORT} via VPC`);
+    // Open a raw TCP connection to the HTTP proxy through the VPC tunnel.
+    log.debug(`Connecting to HTTP proxy at ${env.PROXY_HOST}:${env.PROXY_PORT} via VPC`);
     let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
-
     try {
       socket = await env.VPC.connect({
-        hostname: env.SOCKS5_HOST,
-        port: parseInt(env.SOCKS5_PORT, 10),
+        hostname: env.PROXY_HOST,
+        port: parseInt(env.PROXY_PORT, 10),
       });
       log.debug("VPC TCP connection established");
     } catch (err) {
       log.error(`VPC connect failed: ${err}`);
-      return new Response("Bad Gateway: could not connect to SOCKS5 proxy", { status: 502 });
+      return new Response("Bad Gateway: could not connect to HTTP proxy", { status: 502 });
     }
 
-    const bufferedReader = new BufferedReader(socket.readable.getReader());
+    const reader = new BufferedReader(socket.readable.getReader());
     const writer = socket.writable.getWriter();
 
     try {
-      // Perform the SOCKS5 CONNECT handshake to establish the tunnel.
-      // Credentials are optional — if absent the proxy is contacted unauthenticated.
-      await socks5Connect(bufferedReader, writer, targetHost, targetPort, env.SOCKS5_USERNAME, env.SOCKS5_PASSWORD, log);
+      if (isHttps) {
+        // ── HTTPS ────────────────────────────────────────────────────────────
+        // Send CONNECT to establish a transparent tunnel, then send plain HTTP
+        // through it. The proxy handles TLS to the origin.
+        await httpProxyConnect(reader, writer, targetHost, targetPort, proxyAuth, log);
 
-      // Serialise and send the HTTP request into the tunnel.
-      const httpRequestBytes = await buildHttpRequest(request, url, log);
-      log.debug(`Writing ${httpRequestBytes.length} bytes to tunnel`);
-      await writer.write(httpRequestBytes);
-      // Do NOT close the writer here — some servers stream responses before
-      // they finish reading the request body.
+        const rawRequest = await buildRawRequest(request, url, false, log);
+        log.debug(`Writing ${rawRequest.length} bytes into CONNECT tunnel`);
+        await writer.write(rawRequest);
+      } else {
+        // ── HTTP ─────────────────────────────────────────────────────────────
+        // Send an absolute-form request directly to the proxy.
+        // Inject Proxy-Authorization if credentials are set.
+        const rawRequest = await buildRawRequest(request, url, true, log);
+        log.debug(`Writing ${rawRequest.length} bytes to HTTP proxy`);
+        await writer.write(rawRequest);
+      }
 
-      // Convert the BufferedReader back to a ReadableStream. Any bytes that
-      // arrived alongside the SOCKS5 reply (the remainder buffer) are
-      // re-emitted first, followed by new chunks from the socket.
-      const responseStream = bufferedReader.toReadableStream();
-
-      log.debug("Parsing HTTP response from tunnel");
+      const responseStream = reader.toReadableStream();
+      log.debug("Parsing HTTP response");
       const response = await parseHttpResponse(responseStream, writer, log);
       log.info(`Response: ${response.status} ${response.statusText}`);
       return response;
     } catch (err) {
       log.error(`Proxy error: ${err}`);
       try { writer.close(); } catch { /* ignore */ }
-      try { bufferedReader.cancel(); } catch { /* ignore */ }
+      try { reader.cancel(); } catch { /* ignore */ }
       return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
     }
   }
@@ -598,17 +449,12 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
  * Reads the HTTP/1.1 status line and headers from `stream`, then returns a
  * `Response` object with the parsed status/headers and the remaining body
  * as a streaming ReadableStream.
- *
- * This is necessary because we receive a raw TCP byte stream from the SOCKS5
- * tunnel and need to present a proper `Response` to the Workers runtime.
  */
 async function parseHttpResponse(
   stream: ReadableStream<Uint8Array>,
   writer: WritableStreamDefaultWriter<Uint8Array>,
   log: Logger
 ): Promise<Response> {
-  // We need to buffer bytes until we find the end of the HTTP headers
-  // (the blank line \r\n\r\n), then split header bytes from body bytes.
   const CRLF2 = "\r\n\r\n";
   const chunks: Uint8Array[] = [];
   let headerText: string | null = null;
@@ -621,13 +467,11 @@ async function parseHttpResponse(
     if (done) break;
     chunks.push(value as Uint8Array);
 
-    // Concatenate what we have so far and look for the header/body boundary.
     const soFar = concat(chunks);
-    const text = new TextDecoder("latin1").decode(soFar); // latin1 to preserve byte values
+    const text = new TextDecoder("latin1").decode(soFar);
     const sep = text.indexOf(CRLF2);
     if (sep !== -1) {
       headerText = text.substring(0, sep);
-      // Everything after the blank line is the start of the body.
       const bodyStart = sep + CRLF2.length;
       if (bodyStart < soFar.length) {
         bodyRemainder = soFar.subarray(bodyStart);
@@ -636,12 +480,11 @@ async function parseHttpResponse(
   }
 
   if (!headerText) {
-    throw new Error("SOCKS5 upstream closed connection before sending HTTP headers");
+    throw new Error("Proxy upstream closed connection before sending HTTP headers");
   }
 
   log.debug(`HTTP response headers:\n${headerText}`);
 
-  // Parse status line
   const lines = headerText.split("\r\n");
   const statusLine = lines[0];
   const statusMatch = statusLine.match(/^HTTP\/1\.[01] (\d{3})(?: (.*))?$/);
@@ -651,7 +494,6 @@ async function parseHttpResponse(
   const status = parseInt(statusMatch[1], 10);
   const statusText = statusMatch[2] ?? "";
 
-  // Parse headers
   const responseHeaders = new Headers();
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
@@ -668,30 +510,22 @@ async function parseHttpResponse(
 
   log.debug(`Body remainder from header parse: ${bodyRemainder?.length ?? 0} bytes`);
 
-  // Build the body stream: prepend any remainder bytes from the header parse,
-  // then continue from the reader.
   const bodyStream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      if (bodyRemainder && bodyRemainder.length > 0) {
-        controller.enqueue(bodyRemainder);
-      }
+      if (bodyRemainder && bodyRemainder.length > 0) controller.enqueue(bodyRemainder);
     },
     async pull(controller) {
       const { done, value } = await reader.read();
       if (done) {
         controller.close();
-        // Close the writer now that the response is fully consumed.
         try { writer.close(); } catch { /* ignore */ }
       } else {
         controller.enqueue(value as Uint8Array);
       }
     },
-    cancel() {
-      reader.cancel();
-    },
+    cancel() { reader.cancel(); },
   });
 
-  // 204 / 304 responses must not carry a body.
   const noBody = status === 204 || status === 304;
 
   return new Response(noBody ? null : bodyStream, {
@@ -709,9 +543,17 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   const total = chunks.reduce((n, c) => n + c.length, 0);
   const out = new Uint8Array(total);
   let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.length;
-  }
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
   return out;
+}
+
+/** Find the byte offset of a sub-sequence within a Uint8Array, or -1. */
+function indexOfSequence(haystack: Uint8Array, needle: Uint8Array): number {
+  outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
 }
