@@ -10,19 +10,22 @@
  * the plain Request to this Worker's GatewayMiddleware.handle() method.
  *
  * Protocol:
- *   HTTP  → PROXY sends  "GET http://host/path HTTP/1.1"  (absolute-form)
- *           The HTTP proxy forwards the request to the origin directly.
+ *   Both HTTP and HTTPS requests are forwarded to tinyproxy using
+ *   absolute-form request targets:
  *
- *   HTTPS → Worker sends "CONNECT host:443 HTTP/1.1" to the proxy.
- *           Proxy replies "200 Connection established".
- *           Worker then sends plain HTTP through the transparent tunnel.
- *           The proxy handles TLS to the origin — the Worker never sees it.
+ *     GET http://example.com/path  HTTP/1.1
+ *     GET https://example.com/path HTTP/1.1
+ *
+ *   Tinyproxy fetches the resource itself, handling TLS toward the origin
+ *   for https:// targets. The Worker never needs to speak TLS — Gateway
+ *   already decrypted the client's TLS, and tinyproxy handles the outbound
+ *   TLS. This avoids the VPC connect() plaintext-only limitation entirely.
  *
  * Flow:
  *   Client → Cloudflare Gateway (TLS termination + policy match)
  *     → GatewayMiddleware.handle(request, context, next)
  *       → VPC connect() → Cloudflare Tunnel (mad01-k8s)
- *         → HTTP proxy (172.18.0.21:8080) → Target origin
+ *         → tinyproxy (172.18.0.22:8888) → Target origin (HTTP or HTTPS)
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -148,30 +151,6 @@ class BufferedReader {
   }
 
   /**
-   * Read bytes until the delimiter sequence is found, returning everything
-   * up to and including the delimiter. Excess bytes are kept in remainder.
-   */
-  async readUntil(delimiter: Uint8Array): Promise<Uint8Array> {
-    const chunks: Uint8Array[] = this.remainder.length > 0
-      ? [this.remainder]
-      : [];
-    this.remainder = new Uint8Array(0);
-
-    while (true) {
-      const combined = concat(chunks);
-      const idx = indexOfSequence(combined, delimiter);
-      if (idx !== -1) {
-        const end = idx + delimiter.length;
-        this.remainder = combined.subarray(end);
-        return combined.subarray(0, end);
-      }
-      const { done, value } = await this.inner.read();
-      if (done) throw new Error("Proxy: stream ended before delimiter found");
-      chunks.push(value as Uint8Array);
-    }
-  }
-
-  /**
    * Convert the remaining unread data + underlying reader back into a
    * ReadableStream, for handing off to the HTTP response parser.
    */
@@ -195,54 +174,6 @@ class BufferedReader {
   }
 
   cancel(): void { this.inner.cancel(); }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP proxy handshake
-// ---------------------------------------------------------------------------
-
-/**
- * Send HTTP CONNECT to the proxy and wait for "200 Connection established".
- * After this returns the socket is a transparent byte pipe to targetHost:targetPort.
- */
-async function httpProxyConnect(
-  reader: BufferedReader,
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  targetHost: string,
-  targetPort: number,
-  proxyAuth: string | null,
-  log: Logger
-): Promise<void> {
-  const enc = new TextEncoder();
-
-  const lines = [
-    `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
-    `Host: ${targetHost}:${targetPort}`,
-  ];
-  if (proxyAuth) lines.push(`Proxy-Authorization: Basic ${proxyAuth}`);
-  lines.push("", ""); // blank line terminating headers
-
-  const request = enc.encode(lines.join("\r\n"));
-  log.debug(`HTTP CONNECT → ${targetHost}:${targetPort}`);
-  await writer.write(request);
-
-  // Read the proxy response up to and including the blank line.
-  const CRLF2 = enc.encode("\r\n\r\n");
-  const responseBytes = await reader.readUntil(CRLF2);
-  const responseText = new TextDecoder("latin1").decode(responseBytes);
-  log.debug(`HTTP CONNECT response ←\n${responseText.trimEnd()}`);
-
-  // Expect HTTP/1.x 200 ...
-  const statusMatch = responseText.match(/^HTTP\/1\.[01] (\d{3})/);
-  if (!statusMatch) {
-    throw new Error(`Proxy: unrecognised CONNECT response: ${responseText.split("\r\n")[0]}`);
-  }
-  const status = parseInt(statusMatch[1], 10);
-  if (status !== 200) {
-    throw new Error(`Proxy: CONNECT failed with status ${status}: ${responseText.split("\r\n")[0]}`);
-  }
-
-  log.debug("HTTP CONNECT tunnel established");
 }
 
 // ---------------------------------------------------------------------------
@@ -293,28 +224,26 @@ const STRIP_RESPONSE = new Set([
 // ---------------------------------------------------------------------------
 
 /**
- * Serialise the incoming Request into raw HTTP/1.1 bytes to write into the
- * tunnel.
+ * Serialise the incoming Request into raw HTTP/1.1 bytes for an HTTP forward
+ * proxy. The request-target is always absolute-form (http:// or https://) so
+ * the proxy knows where to fetch the resource. Tinyproxy handles TLS to the
+ * origin for https:// targets — the Worker never speaks TLS itself.
  *
- * For HTTP:  request-target is absolute-form (http://host/path) so the proxy
- *            knows where to forward it.
- * For HTTPS: request-target is origin-form (/path) because by this point a
- *            CONNECT tunnel is established and the proxy is transparent.
+ * proxyAuth: base64-encoded "user:pass" for Proxy-Authorization, or null.
  */
 async function buildRawRequest(
   request: Request,
   url: URL,
-  useAbsoluteForm: boolean,
+  proxyAuth: string | null,
   log: Logger
 ): Promise<Uint8Array> {
-  const method = request.method;
-  const target = useAbsoluteForm
-    ? url.toString()
-    : (url.pathname + url.search || "/");
-
   const lines: string[] = [];
-  lines.push(`${method} ${target} HTTP/1.1`);
+  lines.push(`${request.method} ${url.toString()} HTTP/1.1`);
   lines.push(`Host: ${url.hostname}${url.port ? ":" + url.port : ""}`);
+
+  if (proxyAuth) {
+    lines.push(`Proxy-Authorization: Basic ${proxyAuth}`);
+  }
 
   for (const [name, value] of request.headers) {
     if (HOP_BY_HOP.has(name.toLowerCase())) {
@@ -409,23 +338,12 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     const writer = socket.writable.getWriter();
 
     try {
-      if (isHttps) {
-        // ── HTTPS ────────────────────────────────────────────────────────────
-        // Send CONNECT to establish a transparent tunnel, then send plain HTTP
-        // through it. The proxy handles TLS to the origin.
-        await httpProxyConnect(reader, writer, targetHost, targetPort, proxyAuth, log);
-
-        const rawRequest = await buildRawRequest(request, url, false, log);
-        log.debug(`Writing ${rawRequest.length} bytes into CONNECT tunnel`);
-        await writer.write(rawRequest);
-      } else {
-        // ── HTTP ─────────────────────────────────────────────────────────────
-        // Send an absolute-form request directly to the proxy.
-        // Inject Proxy-Authorization if credentials are set.
-        const rawRequest = await buildRawRequest(request, url, true, log);
-        log.debug(`Writing ${rawRequest.length} bytes to HTTP proxy`);
-        await writer.write(rawRequest);
-      }
+      // Send an absolute-form request to the proxy for both HTTP and HTTPS.
+      // Tinyproxy fetches the resource itself, speaking TLS to the origin
+      // for https:// targets. No CONNECT tunnel is needed.
+      const rawRequest = await buildRawRequest(request, url, proxyAuth, log);
+      log.debug(`Writing ${rawRequest.length} bytes to proxy`);
+      await writer.write(rawRequest);
 
       const responseStream = reader.toReadableStream();
       log.debug("Parsing HTTP response");
@@ -547,13 +465,4 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   return out;
 }
 
-/** Find the byte offset of a sub-sequence within a Uint8Array, or -1. */
-function indexOfSequence(haystack: Uint8Array, needle: Uint8Array): number {
-  outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
-    for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) continue outer;
-    }
-    return i;
-  }
-  return -1;
-}
+
