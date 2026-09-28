@@ -1,0 +1,31 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "workers-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-28",
+
+  // VPC Network binding — routes connect() calls through the mad01-k8s Cloudflare Tunnel
+  "vpc_networks": [
+    {
+      "binding": "VPC",
+      "tunnel_id": "9ab52e82-7276-43c3-8acc-7a5e99556e9f",
+      "remote": true
+    }
+  ],
+
+  // SOCKS5 proxy address reachable behind the tunnel
+  "vars": {
+    "SOCKS5_HOST": "172.18.0.21",
+    "SOCKS5_PORT": "1080",
+    "DEBUG": "true"
+  },
+
+  // SOCKS5_USERNAME and SOCKS5_PASSWORD are stored as encrypted secrets.
+  // Set them with:
+  //   wrangler secret put SOCKS5_USERNAME
+  //   wrangler secret put SOCKS5_PASSWORD
+
+  "observability": {
+    "enabled": true
+  }
+}
