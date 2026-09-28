@@ -1,16 +1,24 @@
 /**
  * workers-proxy
  *
- * A Cloudflare Worker that acts as a forward HTTP proxy by tunneling every
- * request through a SOCKS5 proxy that lives on a private network accessible
- * via a Workers VPC Network binding (Cloudflare Tunnel).
+ * A Cloudflare Gateway middleware Worker that acts as a forward HTTP proxy by
+ * tunneling every request through a SOCKS5 proxy on a private network,
+ * reachable via a Workers VPC Network binding over a Cloudflare Tunnel.
+ *
+ * It is deployed as a Gateway Custom Action (Programmable Gateway / Gateway
+ * Workers). Gateway matches HTTP policy rules, decrypts TLS, and dispatches
+ * the plain Request to this Worker's GatewayMiddleware.handle() method.
+ * The Worker tunnels the request through SOCKS5 and returns the response;
+ * Gateway forwards that response back to the client.
  *
  * Flow:
- *   Client → (HTTPS, TLS terminated at CF edge) → Worker
- *   Worker → (plaintext TCP via VPC connect()) → Cloudflare Tunnel
- *   Cloudflare Tunnel → (local network) → SOCKS5 proxy (172.18.0.21:1080)
- *   SOCKS5 proxy → Target origin
+ *   Client → Cloudflare Gateway (TLS termination + policy match)
+ *     → GatewayMiddleware.handle(request, context, next)
+ *       → VPC connect() → Cloudflare Tunnel (mad01-k8s)
+ *         → SOCKS5 proxy (172.18.0.21:1080) → Target origin
  */
+
+import { WorkerEntrypoint } from "cloudflare:workers";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -366,22 +374,45 @@ function readerToReadableStream(
 }
 
 // ---------------------------------------------------------------------------
-// Main Worker handler
+// Gateway middleware entry point
 // ---------------------------------------------------------------------------
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+/**
+ * Gateway Custom Action middleware.
+ *
+ * The class name GatewayMiddleware is part of the Gateway contract and must
+ * not be renamed. Gateway invokes handle(request, context, next) for every
+ * HTTP request that matches the associated policy rule.
+ *
+ * In this implementation next() is never called: the Worker is the egress
+ * path itself — it opens a SOCKS5 tunnel through the VPC binding and forwards
+ * the request there, replacing what next() would normally do.
+ *
+ * context carries Gateway request-phase selectors (src_ip, host, uri, etc.).
+ */
+export class GatewayMiddleware extends WorkerEntrypoint<Env> {
+  async handle(
+    request: Request,
+    context: Record<string, unknown>,
+    // next is provided by Gateway but not used here — this Worker is the egress.
+    _next: (req: Request) => Promise<Response>
+  ): Promise<Response> {
+    // env is available as this.env in WorkerEntrypoint subclasses.
+    const env = this.env;
+
     const requestId = newRequestId();
     const log = makeLogger(env, requestId);
-    log.info("Custom Worker reached")
+
+    log.info("GatewayMiddleware.handle() invoked");
+    log.debug(`Gateway context: ${JSON.stringify(context)}`);
 
     const url = new URL(request.url);
 
     log.info(`${request.method} ${url.hostname}:${url.port || (url.protocol === "https:" ? 443 : 80)}`);
     log.debug(`Full URL: ${url.toString()}`);
-    log.debug(`Incoming headers: ${[...request.headers.entries()].map(([k,v]) => `${k}: ${v}`).join(", ")}`);
+    log.debug(`Incoming headers: ${[...request.headers.entries()].map(([k, v]) => `${k}: ${v}`).join(", ")}`);
 
-    // Determine target host and port from the incoming request.
+    // Determine target host and port from the incoming request URL.
     const targetHost = url.hostname;
     const defaultPort = url.protocol === "https:" ? 443 : 80;
     const targetPort = url.port ? parseInt(url.port, 10) : defaultPort;
@@ -417,34 +448,25 @@ export default {
       const httpRequestBytes = await buildHttpRequest(request, url, log);
       log.debug(`Writing ${httpRequestBytes.length} bytes to tunnel`);
       await writer.write(httpRequestBytes);
-      // Do NOT close the writer here — some servers need the connection kept
-      // alive for streaming; we let socket.readable EOF drive the close.
+      // Do NOT close the writer here — some servers stream responses before
+      // they finish reading the request body.
 
-      // Stream the raw HTTP response back to the client.
-      // The Workers runtime will handle the HTTP framing on the response side.
-      // We return the raw stream as-is; the runtime parses the status line and
-      // headers automatically when given a ReadableStream response body.
-      //
-      // NOTE: We cannot simply do `new Response(socket.readable)` because we
-      // have already locked the readable side via `getReader()`. We must
-      // instead wrap the locked reader back into a new ReadableStream.
+      // Wrap the locked reader back into a fresh ReadableStream so we can
+      // pass it to parseHttpResponse without unlocking it.
       const responseStream = readerToReadableStream(reader);
 
-      // Parse the HTTP response from the stream so we can return a proper
-      // Response object with correct status code and headers.
       log.debug("Parsing HTTP response from tunnel");
       const response = await parseHttpResponse(responseStream, writer, log);
       log.info(`Response: ${response.status} ${response.statusText}`);
       return response;
     } catch (err) {
       log.error(`Proxy error: ${err}`);
-      // Best-effort cleanup
       try { writer.close(); } catch { /* ignore */ }
       try { reader.cancel(); } catch { /* ignore */ }
       return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
     }
-  },
-} satisfies ExportedHandler<Env>;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP/1.1 response parser
