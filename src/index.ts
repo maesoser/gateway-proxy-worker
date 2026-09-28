@@ -348,8 +348,36 @@ async function socks5Connect(
 // HTTP request serialisation
 // ---------------------------------------------------------------------------
 
-/** Headers that must not be forwarded to the upstream (hop-by-hop). */
+/** Headers stripped from outgoing requests to the upstream. */
 const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  // Gateway decrypts TLS and may decode the body before the Worker sees it.
+  // Forwarding accept-encoding would cause the origin to send a compressed
+  // body that the Worker (or the browser) then fails to decode correctly.
+  "accept-encoding",
+]);
+
+/**
+ * Headers stripped from upstream responses before returning to the client.
+ *
+ * Gateway decrypts TLS and may decode compressed bodies before the Worker
+ * receives them. If the origin's Content-Encoding header is forwarded
+ * unchanged, the browser will try to decompress an already-decoded body and
+ * produce ERR_CONTENT_DECODING_FAILED. Content-Length is also removed because
+ * the decoded body length will differ from the originally compressed one.
+ */
+const STRIP_RESPONSE = new Set([
+  "content-encoding",
+  "content-length",
+  // Standard hop-by-hop headers that must not cross a proxy boundary.
   "connection",
   "keep-alive",
   "proxy-authenticate",
@@ -487,7 +515,25 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       log.debug("HTTPS request — forwarding via env.VPC.fetch()");
       try {
         const proxyReq = buildFetchRequest(request, url, log);
-        const response = await env.VPC.fetch(proxyReq);
+        const upstreamRes = await env.VPC.fetch(proxyReq);
+
+        // Rebuild the response without content-encoding / content-length.
+        // The Workers runtime may have already decoded the body; forwarding
+        // those headers would cause ERR_CONTENT_DECODING_FAILED in the browser.
+        const resHeaders = new Headers();
+        for (const [name, value] of upstreamRes.headers) {
+          if (STRIP_RESPONSE.has(name.toLowerCase())) {
+            log.debug(`Dropping response header: ${name}`);
+            continue;
+          }
+          resHeaders.set(name, value);
+        }
+
+        const response = new Response(upstreamRes.body, {
+          status: upstreamRes.status,
+          statusText: upstreamRes.statusText,
+          headers: resHeaders,
+        });
         log.info(`Response: ${response.status} ${response.statusText}`);
         return response;
       } catch (err) {
@@ -613,9 +659,8 @@ async function parseHttpResponse(
     if (colon === -1) continue;
     const name = line.substring(0, colon).trim().toLowerCase();
     const value = line.substring(colon + 1).trim();
-    // Skip hop-by-hop headers — the Workers runtime manages these.
-    if (HOP_BY_HOP.has(name)) {
-      log.debug(`Dropping upstream hop-by-hop header: ${name}`);
+    if (STRIP_RESPONSE.has(name)) {
+      log.debug(`Dropping response header: ${name}`);
       continue;
     }
     responseHeaders.append(name, value);
