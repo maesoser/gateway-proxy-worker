@@ -15,8 +15,8 @@
 
   // HTTP proxy address reachable behind the tunnel
   "vars": {
-    "PROXY_HOST": "172.18.0.21",
-    "PROXY_PORT": "8080",
+    "PROXY_HOST": "172.18.0.22",
+    "PROXY_PORT": "8888",
     "DEBUG": "true"
   },
 
