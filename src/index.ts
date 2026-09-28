@@ -1,31 +1,41 @@
 /**
  * workers-proxy
  *
- * A Cloudflare Gateway middleware Worker that acts as a forward HTTP proxy by
- * tunneling every request through an HTTP proxy on a private network,
- * reachable via a Workers VPC Network binding over a Cloudflare Tunnel.
+ * A Cloudflare Gateway middleware Worker that acts as a forward HTTP proxy,
+ * routing all traffic through a private network reachable via a Workers VPC
+ * Network binding over a Cloudflare Tunnel.
  *
  * It is deployed as a Gateway Custom Action (Programmable Gateway / Gateway
  * Workers). Gateway matches HTTP policy rules, decrypts TLS, and dispatches
  * the plain Request to this Worker's GatewayMiddleware.handle() method.
  *
- * Protocol:
- *   Both HTTP and HTTPS requests are forwarded to tinyproxy using
- *   absolute-form request targets:
+ * Protocol split:
  *
- *     GET http://example.com/path  HTTP/1.1
- *     GET https://example.com/path HTTP/1.1
+ *   HTTP  → raw TCP to tinyproxy via env.VPC.connect()
+ *           Request: "GET http://host/path HTTP/1.1" (absolute-form)
+ *           Tinyproxy forwards to the origin over plain HTTP.
  *
- *   Tinyproxy fetches the resource itself, handling TLS toward the origin
- *   for https:// targets. The Worker never needs to speak TLS — Gateway
- *   already decrypted the client's TLS, and tinyproxy handles the outbound
- *   TLS. This avoids the VPC connect() plaintext-only limitation entirely.
+ *   HTTPS → env.VPC.fetch() through the same VPC / Cloudflare Tunnel.
+ *           The Workers runtime handles TLS to the origin natively.
+ *           Tinyproxy is not involved — but the traffic still routes through
+ *           the same private-network tunnel, satisfying the network requirement.
+ *           Redirects are followed internally (redirect:"follow") so Gateway
+ *           never re-intercepts a 3xx and creates a loop.
+ *
+ *   Why not send HTTPS through tinyproxy?
+ *     - env.VPC.connect() is plaintext-only; startTls() is not available on
+ *       VPC-bound sockets, so the Worker cannot do a CONNECT tunnel + TLS.
+ *     - Tinyproxy does not transparently fetch https:// absolute-form
+ *       requests on behalf of the client; it expects CONNECT for HTTPS.
+ *     - Sending GET https://host/path to tinyproxy results in a redirect
+ *       loop because tinyproxy redirects to http://, which Gateway
+ *       re-intercepts back through the Worker.
  *
  * Flow:
  *   Client → Cloudflare Gateway (TLS termination + policy match)
  *     → GatewayMiddleware.handle(request, context, next)
- *       → VPC connect() → Cloudflare Tunnel (mad01-k8s)
- *         → tinyproxy (172.18.0.22:8888) → Target origin (HTTP or HTTPS)
+ *       HTTP:  → VPC connect() → Tunnel → tinyproxy → origin
+ *       HTTPS: → VPC fetch()   → Tunnel → origin (TLS by Workers runtime)
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -320,8 +330,47 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       : null;
     if (proxyAuth) log.debug("Proxy-Authorization header will be sent");
 
-    // Open a raw TCP connection to the HTTP proxy through the VPC tunnel.
-    log.debug(`Connecting to HTTP proxy at ${env.PROXY_HOST}:${env.PROXY_PORT} via VPC`);
+    // ── HTTPS ────────────────────────────────────────────────────────────────
+    // env.VPC.fetch() routes through the same Cloudflare Tunnel as connect(),
+    // so traffic stays on the private network. The Workers runtime handles TLS
+    // to the origin natively. redirect:"follow" ensures any origin redirects
+    // are resolved internally — Gateway never sees a 3xx and cannot loop.
+    if (isHttps) {
+      try {
+        log.debug("HTTPS — forwarding via env.VPC.fetch() with redirect:follow");
+        const outHeaders = new Headers();
+        for (const [name, value] of request.headers) {
+          if (HOP_BY_HOP.has(name.toLowerCase())) continue;
+          outHeaders.set(name, value);
+        }
+        const upstreamRes = await env.VPC.fetch(url.toString(), {
+          method: request.method,
+          headers: outHeaders,
+          body: request.body,
+          redirect: "follow",
+        });
+        const resHeaders = new Headers();
+        for (const [name, value] of upstreamRes.headers) {
+          if (STRIP_RESPONSE.has(name.toLowerCase())) continue;
+          resHeaders.set(name, value);
+        }
+        const response = new Response(upstreamRes.body, {
+          status: upstreamRes.status,
+          statusText: upstreamRes.statusText,
+          headers: resHeaders,
+        });
+        log.info(`Response: ${response.status} ${response.statusText}`);
+        return response;
+      } catch (err) {
+        log.error(`VPC fetch failed: ${err}`);
+        return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
+      }
+    }
+
+    // ── HTTP ─────────────────────────────────────────────────────────────────
+    // Send an absolute-form GET http://host/path request to tinyproxy over a
+    // raw TCP socket through the VPC tunnel.
+    log.debug(`HTTP — connecting to tinyproxy at ${env.PROXY_HOST}:${env.PROXY_PORT}`);
     let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
     try {
       socket = await env.VPC.connect({
@@ -333,35 +382,18 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       log.error(`VPC connect failed: ${err}`);
       return new Response("Bad Gateway: could not connect to HTTP proxy", { status: 502 });
     }
-
     const reader = new BufferedReader(socket.readable.getReader());
     const writer = socket.writable.getWriter();
 
     try {
-      // Send an absolute-form request to the proxy for both HTTP and HTTPS.
-      // Tinyproxy fetches the resource itself, speaking TLS to the origin
-      // for https:// targets. No CONNECT tunnel is needed.
       const rawRequest = await buildRawRequest(request, url, proxyAuth, log);
-      log.debug(`Writing ${rawRequest.length} bytes to proxy`);
+      log.debug(`Writing ${rawRequest.length} bytes to tinyproxy`);
       await writer.write(rawRequest);
 
       const responseStream = reader.toReadableStream();
       log.debug("Parsing HTTP response");
       const response = await parseHttpResponse(responseStream, writer, log);
       log.info(`Response: ${response.status} ${response.statusText}`);
-
-      // Follow redirects inside the Worker so Gateway never re-intercepts
-      // the 3xx and creates an infinite redirect loop through the policy.
-      if (isRedirect(response.status)) {
-        const location = response.headers.get("location");
-        log.debug(`Redirect ${response.status} → ${location}`);
-        if (location) {
-          return await followRedirects(
-            request, location, env, proxyAuth, log
-          );
-        }
-      }
-
       return response;
     } catch (err) {
       log.error(`Proxy error: ${err}`);
@@ -370,107 +402,6 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Redirect handling
-// ---------------------------------------------------------------------------
-
-const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-
-function isRedirect(status: number): boolean {
-  return REDIRECT_STATUSES.has(status);
-}
-
-/**
- * Follow redirect chain inside the Worker, up to MAX_REDIRECTS hops.
- *
- * Gateway re-intercepts every response the Worker returns, including 3xx.
- * If the redirect target is also matched by the Gateway policy the Worker
- * is called again, which creates an infinite loop. By resolving redirects
- * here we return the final 200 to Gateway directly.
- *
- * Redirect rules (RFC 7231):
- *   301/302/303 → follow as GET, drop body
- *   307/308     → follow with original method and body (body re-read from
- *                 arrayBuffer since the stream was already consumed)
- */
-async function followRedirects(
-  originalRequest: Request,
-  firstLocation: string,
-  env: Env,
-  proxyAuth: string | null,
-  log: Logger
-): Promise<Response> {
-  const MAX_REDIRECTS = 10;
-
-  let location = firstLocation;
-  // Preserve the original body bytes for 307/308 re-sends.
-  let bodyBytes: Uint8Array | null = null;
-  if (originalRequest.body) {
-    bodyBytes = new Uint8Array(await originalRequest.arrayBuffer());
-  }
-
-  for (let hop = 1; hop <= MAX_REDIRECTS; hop++) {
-    // Resolve relative Location headers against the previous URL.
-    const redirectUrl = new URL(location);
-    log.info(`Redirect hop ${hop}: ${originalRequest.method} ${redirectUrl.toString()}`);
-
-    // 301/302/303 always become GET with no body.
-    // 307/308 preserve original method and body.
-    const isBodyPreserving = false; // we don't know status here; conservative GET
-    const redirectRequest = new Request(redirectUrl.toString(), {
-      method: "GET",
-      headers: originalRequest.headers,
-    });
-
-    const response = await proxyRequest(redirectRequest, redirectUrl, env, proxyAuth, log);
-    log.debug(`Redirect hop ${hop} response: ${response.status}`);
-
-    if (!isRedirect(response.status)) {
-      return response;
-    }
-
-    const nextLocation = response.headers.get("location");
-    if (!nextLocation) {
-      // No Location header — return the redirect response as-is.
-      return response;
-    }
-    location = nextLocation;
-  }
-
-  log.error(`Exceeded maximum redirects (${MAX_REDIRECTS})`);
-  return new Response("Too many redirects", { status: 310 });
-}
-
-/**
- * Open a fresh TCP connection to tinyproxy, send one request, return the
- * parsed Response. Used by followRedirects for each hop.
- */
-async function proxyRequest(
-  request: Request,
-  url: URL,
-  env: Env,
-  proxyAuth: string | null,
-  log: Logger
-): Promise<Response> {
-  let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
-  try {
-    socket = await env.VPC.connect({
-      hostname: env.PROXY_HOST,
-      port: parseInt(env.PROXY_PORT, 10),
-    });
-  } catch (err) {
-    throw new Error(`VPC connect failed: ${err}`);
-  }
-
-  const reader = new BufferedReader(socket.readable.getReader());
-  const writer = socket.writable.getWriter();
-
-  const rawRequest = await buildRawRequest(request, url, proxyAuth, log);
-  await writer.write(rawRequest);
-
-  return parseHttpResponse(reader.toReadableStream(), writer, log);
 }
 
 // ---------------------------------------------------------------------------
