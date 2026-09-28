@@ -406,6 +406,29 @@ async function buildHttpRequest(request: Request, url: URL, log: Logger): Promis
   return headerBytes;
 }
 
+/**
+ * Build a fetch()-compatible Request from the incoming Gateway request.
+ * Used for the HTTPS path where env.VPC.fetch() handles TLS natively.
+ */
+function buildFetchRequest(request: Request, url: URL, log: Logger): Request {
+  const headers = new Headers();
+  for (const [name, value] of request.headers) {
+    if (HOP_BY_HOP.has(name.toLowerCase())) {
+      log.debug(`Dropping hop-by-hop header: ${name}`);
+      continue;
+    }
+    headers.set(name, value);
+  }
+
+  log.debug(`Fetch request headers: ${[...headers.entries()].map(([k, v]) => `${k}: ${v}`).join(", ")}`);
+
+  return new Request(url.toString(), {
+    method: request.method,
+    headers,
+    body: request.body,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Gateway middleware entry point
 // ---------------------------------------------------------------------------
@@ -455,11 +478,29 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       return new Response("Bad Request: missing host", { status: 400 });
     }
 
+    // ── HTTPS: use env.VPC.fetch() ──────────────────────────────────────────
+    // VPC Network connect() supports plaintext TCP only — startTls() is not
+    // available on VPC-bound sockets. For HTTPS targets we therefore use
+    // env.VPC.fetch(), which handles TLS natively and routes through the same
+    // Cloudflare Tunnel. The SOCKS5 raw-TCP path is kept for plain HTTP only.
+    if (url.protocol === "https:") {
+      log.debug("HTTPS request — forwarding via env.VPC.fetch()");
+      try {
+        const proxyReq = buildFetchRequest(request, url, log);
+        const response = await env.VPC.fetch(proxyReq);
+        log.info(`Response: ${response.status} ${response.statusText}`);
+        return response;
+      } catch (err) {
+        log.error(`VPC fetch failed: ${err}`);
+        return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
+      }
+    }
+
+    // ── HTTP: tunnel through SOCKS5 over raw TCP ────────────────────────────
+    log.debug(`HTTP request — connecting to SOCKS5 proxy at ${env.SOCKS5_HOST}:${env.SOCKS5_PORT} via VPC`);
     let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
 
-    log.debug(`Connecting to SOCKS5 proxy at ${env.SOCKS5_HOST}:${env.SOCKS5_PORT} via VPC`);
     try {
-      // Open a raw TCP connection to the SOCKS5 proxy through the VPC tunnel.
       socket = await env.VPC.connect({
         hostname: env.SOCKS5_HOST,
         port: parseInt(env.SOCKS5_PORT, 10),
