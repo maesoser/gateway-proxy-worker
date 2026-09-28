@@ -1,0 +1,19 @@
+wrangler.jsonc
+  s_f95248f9641750::t_5fea118777c085 18-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "26223a6a560f3e1b02750f78d21b95812163e76b",
+  "prompts": {},
+  "sessions": {
+    "s_f95248f9641750": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f1908f115ffe74Nu31Uo6jeNl6",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "Sergio Maeso <sergio@cloudflare.com>"
+    }
+  }
+}
