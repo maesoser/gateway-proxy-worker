@@ -118,31 +118,87 @@ const REP_SUCCESS = 0x00;
 // Low-level helpers
 // ---------------------------------------------------------------------------
 
-/** Read exactly `n` bytes from a reader, accumulating chunks as needed. */
-async function readExactly(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  n: number
-): Promise<Uint8Array> {
-  const buf = new Uint8Array(n);
-  let offset = 0;
-  while (offset < n) {
-    const { done, value } = await reader.read();
-    if (done) throw new Error(`SOCKS5: stream ended after ${offset}/${n} bytes`);
-    const chunk = value as Uint8Array;
-    const needed = n - offset;
-    if (chunk.length <= needed) {
-      buf.set(chunk, offset);
-      offset += chunk.length;
-    } else {
-      // More bytes arrived than needed — take only what we need.
-      // This shouldn't happen in practice but handle it defensively.
-      buf.set(chunk.subarray(0, needed), offset);
-      offset += needed;
-      // The leftover bytes are lost; for a proxy use-case this is fine
-      // because after the handshake we hand off the raw streams.
+/**
+ * Stateful buffered reader that wraps a ReadableStreamDefaultReader.
+ *
+ * go-socks5 (and many other proxies) write the entire CONNECT reply — header
+ * + BND address — in a single TCP segment, which the Workers runtime delivers
+ * as one chunk. A naïve readExactly that reads N bytes and discards the rest
+ * of the chunk will lose the bytes that belong to the next read.
+ *
+ * BufferedReader keeps an internal remainder buffer so that leftover bytes
+ * from an oversized chunk are preserved and returned by the next readExactly
+ * call.
+ */
+class BufferedReader {
+  private remainder: Uint8Array = new Uint8Array(0);
+
+  constructor(private inner: ReadableStreamDefaultReader<Uint8Array>) {}
+
+  async readExactly(n: number): Promise<Uint8Array> {
+    const out = new Uint8Array(n);
+    let offset = 0;
+
+    // Drain the remainder buffer first.
+    if (this.remainder.length > 0) {
+      const take = Math.min(this.remainder.length, n);
+      out.set(this.remainder.subarray(0, take), 0);
+      offset += take;
+      this.remainder = this.remainder.subarray(take);
     }
+
+    // Pull new chunks until we have exactly n bytes.
+    while (offset < n) {
+      const { done, value } = await this.inner.read();
+      if (done) throw new Error(`SOCKS5: stream ended after ${offset}/${n} bytes`);
+      const chunk = value as Uint8Array;
+      const needed = n - offset;
+      if (chunk.length <= needed) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+      } else {
+        // Chunk is larger than needed: take what we need, keep the rest.
+        out.set(chunk.subarray(0, needed), offset);
+        offset += needed;
+        // Preserve leftover bytes for the next readExactly call.
+        this.remainder = chunk.subarray(needed);
+      }
+    }
+
+    return out;
   }
-  return buf;
+
+  /**
+   * Wrap the remaining unread bytes (in the internal buffer) together with
+   * the underlying reader back into a ReadableStream, for handing off to the
+   * HTTP response parser after the SOCKS5 handshake is complete.
+   */
+  toReadableStream(): ReadableStream<Uint8Array> {
+    const remainder = this.remainder;
+    const inner = this.inner;
+    return new ReadableStream<Uint8Array>({
+      async start(controller) {
+        if (remainder.length > 0) {
+          controller.enqueue(remainder);
+        }
+      },
+      async pull(controller) {
+        const { done, value } = await inner.read();
+        if (done) {
+          controller.close();
+        } else {
+          controller.enqueue(value as Uint8Array);
+        }
+      },
+      cancel() {
+        inner.cancel();
+      },
+    });
+  }
+
+  cancel(): void {
+    this.inner.cancel();
+  }
 }
 
 /** Format a Uint8Array as a hex string for debug output. */
@@ -162,7 +218,7 @@ function hex(bytes: Uint8Array): string {
  * byte pipe to `targetHost:targetPort`.
  */
 async function socks5Connect(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
+  reader: BufferedReader,
   writer: WritableStreamDefaultWriter<Uint8Array>,
   targetHost: string,
   targetPort: number,
@@ -184,7 +240,7 @@ async function socks5Connect(
 
   // ── Step 2: Server method selection ──────────────────────────────────────
   // VER | METHOD
-  const methodResponse = await readExactly(reader, 2);
+  const methodResponse = await reader.readExactly(2);
   log.debug(`SOCKS5 method selection ← ${hex(methodResponse)}`);
 
   if (methodResponse[0] !== SOCKS_VERSION) {
@@ -221,7 +277,7 @@ async function socks5Connect(
     await writer.write(authMsg);
 
     // Server auth reply: VER(1) | STATUS(1) — 0x00 means success
-    const authReply = await readExactly(reader, 2);
+    const authReply = await reader.readExactly(2);
     log.debug(`SOCKS5 auth reply ← ${hex(authReply)}`);
 
     if (authReply[1] !== 0x00) {
@@ -259,7 +315,7 @@ async function socks5Connect(
 
   // ── Step 5: Server reply ─────────────────────────────────────────────────
   // VER | REP | RSV | ATYP | BND.ADDR | BND.PORT
-  const replyHeader = await readExactly(reader, 4);
+  const replyHeader = await reader.readExactly(4);
   log.debug(`SOCKS5 CONNECT reply header ← ${hex(replyHeader)}`);
 
   if (replyHeader[0] !== SOCKS_VERSION) {
@@ -272,14 +328,14 @@ async function socks5Connect(
   // Consume the BND.ADDR and BND.PORT fields (we don't use them).
   const atyp = replyHeader[3];
   if (atyp === ATYP_IPV4) {
-    const bnd = await readExactly(reader, 4 + 2);
+    const bnd = await reader.readExactly(4 + 2);
     log.debug(`SOCKS5 BND.ADDR (IPv4) ← ${hex(bnd)}`);
   } else if (atyp === ATYP_IPV6) {
-    const bnd = await readExactly(reader, 16 + 2);
+    const bnd = await reader.readExactly(16 + 2);
     log.debug(`SOCKS5 BND.ADDR (IPv6) ← ${hex(bnd)}`);
   } else if (atyp === ATYP_DOMAINNAME) {
-    const lenBuf = await readExactly(reader, 1);
-    const bnd = await readExactly(reader, lenBuf[0] + 2);
+    const lenBuf = await reader.readExactly(1);
+    const bnd = await reader.readExactly(lenBuf[0] + 2);
     log.debug(`SOCKS5 BND.ADDR (domain) ← ${hex(bnd)}`);
   } else {
     throw new Error(`SOCKS5: unknown ATYP in reply: 0x${atyp.toString(16)}`);
@@ -351,38 +407,6 @@ async function buildHttpRequest(request: Request, url: URL, log: Logger): Promis
 }
 
 // ---------------------------------------------------------------------------
-// ReadableStream helpers for splicing the SOCKS5 reader remainder
-// ---------------------------------------------------------------------------
-
-/**
- * The SOCKS5 handshake reads from the socket's ReadableStream via a locked
- * reader. After the handshake, the reader may contain buffered bytes that
- * are already part of the HTTP response. This function creates a new
- * ReadableStream that prepends any buffered bytes, then continues reading
- * from the original reader.
- *
- * Because the Workers runtime does not let us "unread" bytes back into a
- * locked ReadableStream, we have to pump the rest manually.
- */
-function readerToReadableStream(
-  reader: ReadableStreamDefaultReader<Uint8Array>
-): ReadableStream<Uint8Array> {
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-      } else {
-        controller.enqueue(value as Uint8Array);
-      }
-    },
-    cancel() {
-      reader.cancel();
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
 // Gateway middleware entry point
 // ---------------------------------------------------------------------------
 
@@ -446,13 +470,13 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       return new Response("Bad Gateway: could not connect to SOCKS5 proxy", { status: 502 });
     }
 
-    const reader = socket.readable.getReader();
+    const bufferedReader = new BufferedReader(socket.readable.getReader());
     const writer = socket.writable.getWriter();
 
     try {
       // Perform the SOCKS5 CONNECT handshake to establish the tunnel.
       // Credentials are optional — if absent the proxy is contacted unauthenticated.
-      await socks5Connect(reader, writer, targetHost, targetPort, env.SOCKS5_USERNAME, env.SOCKS5_PASSWORD, log);
+      await socks5Connect(bufferedReader, writer, targetHost, targetPort, env.SOCKS5_USERNAME, env.SOCKS5_PASSWORD, log);
 
       // Serialise and send the HTTP request into the tunnel.
       const httpRequestBytes = await buildHttpRequest(request, url, log);
@@ -461,9 +485,10 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       // Do NOT close the writer here — some servers stream responses before
       // they finish reading the request body.
 
-      // Wrap the locked reader back into a fresh ReadableStream so we can
-      // pass it to parseHttpResponse without unlocking it.
-      const responseStream = readerToReadableStream(reader);
+      // Convert the BufferedReader back to a ReadableStream. Any bytes that
+      // arrived alongside the SOCKS5 reply (the remainder buffer) are
+      // re-emitted first, followed by new chunks from the socket.
+      const responseStream = bufferedReader.toReadableStream();
 
       log.debug("Parsing HTTP response from tunnel");
       const response = await parseHttpResponse(responseStream, writer, log);
@@ -472,7 +497,7 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     } catch (err) {
       log.error(`Proxy error: ${err}`);
       try { writer.close(); } catch { /* ignore */ }
-      try { reader.cancel(); } catch { /* ignore */ }
+      try { bufferedReader.cancel(); } catch { /* ignore */ }
       return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
     }
   }
