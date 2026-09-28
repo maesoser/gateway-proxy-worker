@@ -1,0 +1,22 @@
+src/index.ts
+  s_f95248f9641750::t_ce5ff255289503 518-536
+  s_f95248f9641750::t_40707936a39419 351,362-380
+  s_f95248f9641750::t_8777051477def1 662-663
+  s_f95248f9641750::t_91144a9f679346 381-383
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e577433c58c01189238cc8cb9206217df93607ad",
+  "prompts": {},
+  "sessions": {
+    "s_f95248f9641750": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f1908f115ffe74Nu31Uo6jeNl6",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "Sergio Maeso <sergio@cloudflare.com>"
+    }
+  }
+}
