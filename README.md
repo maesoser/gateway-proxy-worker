@@ -1,6 +1,6 @@
 # workers-proxy
 
-A Cloudflare Worker deployed as a **Gateway Custom Action** middleware that acts as a forward HTTP proxy, routing all traffic through a **FortiGate explicit web proxy** on a private network reachable via a [Workers VPC](https://developers.cloudflare.com/workers-vpc/) Network binding over a Cloudflare Tunnel.
+A Cloudflare Worker deployed as a **Gateway Custom Action** middleware that acts as a forward HTTP proxy, routing all traffic through an HTTP proxy on a private network reachable via a [Workers VPC](https://developers.cloudflare.com/workers-vpc/) Network binding over a Cloudflare Tunnel.
 
 ## Architecture
 
@@ -17,32 +17,38 @@ GatewayMiddleware.handle()   [this Worker]
 Cloudflare Tunnel  (mad01-k8s)
   │  Private LAN
   ▼
-FortiGate explicit web proxy  (172.18.0.22:8888)
+HTTP proxy  (172.18.0.22:8888)
   │  HTTP:  forwards to origin over plain HTTP
-  │  HTTPS: detect-https-in-http-request → TLS to origin
+  │  HTTPS: proxy opens TLS to origin on behalf of the Worker
   ▼
 Target origin
 ```
 
-Gateway terminates the client's TLS before dispatching to the Worker. The Worker receives a plain, decrypted `Request` for both HTTP and HTTPS destinations. It forwards this as an absolute-form HTTP proxy request to FortiGate, which handles the outbound TLS to HTTPS origins.
+Gateway terminates the client's TLS before dispatching to the Worker. The Worker receives a plain, decrypted `Request` for both HTTP and HTTPS destinations. It forwards this as an absolute-form HTTP proxy request; the proxy handles the outbound TLS to HTTPS origins.
 
 ## Protocol
 
 Both HTTP and HTTPS use the same request format — absolute-form URL in the request line:
 
 ```
-GET http://example.com/path HTTP/1.1
+GET http://example.com/path  HTTP/1.1
 GET https://example.com/path HTTP/1.1
 ```
 
-The FortiGate explicit proxy handles each differently:
+The proxy is expected to handle each differently:
 
 - **HTTP** — forwards the request to the origin over plain HTTP.
-- **HTTPS** — the `detect-https-in-http-request` feature detects the `https://` scheme and opens a TLS connection to the origin itself, returning the decrypted response to the Worker over the plain proxy connection.
+- **HTTPS** — the proxy detects the `https://` scheme, opens a TLS connection to the origin itself, and returns the decrypted response to the Worker over the plain proxy connection.
 
 This avoids the need for the Worker to speak TLS, which is not possible via `env.VPC.connect()` (plaintext TCP only).
 
-## Required FortiGate configuration
+## Proxy configuration
+
+The Worker sends `GET https://host/path HTTP/1.1` (absolute-form with `https://` scheme) for HTTPS destinations. Not all HTTP proxies support this — see the compatibility notes below.
+
+### FortiGate explicit web proxy ✓
+
+Enable the explicit web proxy and set `detect-https-in-http-request` in the proxy policy. This is the key knob that allows FortiGate to fetch HTTPS resources when the client sends an absolute-form `https://` URL instead of a CONNECT tunnel.
 
 ```
 config web-proxy explicit
@@ -61,15 +67,37 @@ config firewall proxy-policy
 end
 ```
 
-`detect-https-in-http-request` and `ssl-ssh-profile "deep-inspection"` are mandatory for HTTPS proxying.
+`detect-https-in-http-request` and `ssl-ssh-profile "deep-inspection"` are mandatory — without them FortiGate cannot fetch HTTPS origins on behalf of the Worker.
 
-## Configuration
+### Squid ✓
+
+Squid supports absolute-form HTTPS requests natively in forward proxy mode. No special configuration is needed beyond enabling the proxy and allowing the relevant ACLs:
+
+```
+# /etc/squid/squid.conf (minimal)
+http_port 3128
+
+# Allow connections from the Worker's egress IP (the tunnel exit node)
+acl worker_src src 172.18.0.0/24
+http_access allow worker_src
+http_access deny all
+```
+
+When Squid receives `GET https://host/path HTTP/1.1` it issues its own TLS connection to the origin and returns the decrypted response to the Worker over the plain proxy connection — the same behaviour as FortiGate with `detect-https-in-http-request`.
+
+### tinyproxy ✗ — not compatible
+
+Tinyproxy will not work with this Worker. By design, tinyproxy is a lightweight HTTP proxy that treats HTTPS traffic strictly as an opaque stream via the `CONNECT` method. When it receives `GET https://host/path HTTP/1.1` in absolute-form, it returns `501 Not Implemented` — it has no capability to fetch HTTPS resources itself. The source code confirms this: only `http://` URLs and `CONNECT` requests are handled; everything else falls into a `501` branch.
+
+The `CONNECT`-based approach (which tinyproxy does support) cannot be used here because `env.VPC.connect()` is plaintext-only and `startTls()` is not available on VPC-bound sockets.
+
+## Worker configuration
 
 ### Environment variables (`wrangler.jsonc` → `vars`)
 
 | Variable | Description | Default |
 |---|---|---|
-| `PROXY_HOST` | Hostname or IP of the FortiGate explicit proxy | `172.18.0.22` |
+| `PROXY_HOST` | Hostname or IP of the HTTP proxy reachable behind the tunnel | `172.18.0.22` |
 | `PROXY_PORT` | Port the proxy listens on | `8888` |
 | `FAIL_OPEN` | When `"true"`, falls through to Gateway's normal egress if the proxy is unreachable (and the request body was not yet consumed) instead of returning 502 | `"false"` |
 | `DEBUG` | Set to `"true"` to enable verbose per-request logging | `"true"` |
@@ -78,14 +106,14 @@ end
 
 | Secret | Description |
 |---|---|
-| `PROXY_USERNAME` | HTTP proxy username (Proxy-Authorization: Basic) |
+| `PROXY_USERNAME` | HTTP proxy username (`Proxy-Authorization: Basic`) |
 | `PROXY_PASSWORD` | HTTP proxy password |
 
 Credentials are optional. If absent, requests are sent without a `Proxy-Authorization` header.
 
 ### Workers VPC Network binding (`wrangler.jsonc` → `vpc_networks`)
 
-The binding named `VPC` is pointed at the `mad01-k8s` Cloudflare Tunnel (`9ab52e82-7276-43c3-8acc-7a5e99556e9f`). Any `connect()` call on this binding is routed through that tunnel into the private network where the FortiGate proxy is reachable.
+The binding named `VPC` is pointed at the `mad01-k8s` Cloudflare Tunnel (`9ab52e82-7276-43c3-8acc-7a5e99556e9f`). Any `connect()` call on this binding is routed through that tunnel into the private network where the proxy is reachable.
 
 ## Deployment
 
@@ -133,7 +161,7 @@ When `DEBUG=true`, every request produces structured log lines prefixed with a s
 Request bodies are streamed rather than buffered:
 
 - If `Content-Length` is known, the body is forwarded verbatim.
-- If `Content-Length` is absent (e.g. streaming POST), the body is forwarded as `Transfer-Encoding: chunked` — no buffering in Worker memory.
+- If `Content-Length` is absent (e.g. a streaming POST), the body is forwarded as `Transfer-Encoding: chunked` — no buffering in Worker memory.
 
 ## Response body handling
 
@@ -159,43 +187,11 @@ The following Cloudflare-internal headers are stripped before forwarding to the 
 
 `cf-connecting-ip`, `cf-connecting-ipv6`, `cf-ipcountry`, `cf-ray`, `cf-visitor`, `cf-worker`, `cf-ew-via`, `cdn-loop`, `x-real-ip`
 
-## Proxy compatibility
-
-The Worker sends `GET https://host/path HTTP/1.1` (absolute-form with `https://` scheme) for HTTPS destinations. Not all HTTP proxies support this.
-
-### FortiGate explicit web proxy ✓
-
-Supported via `detect-https-in-http-request`. See [Required FortiGate configuration](#required-fortigate-configuration) above.
-
-### Squid ✓
-
-Squid supports absolute-form HTTPS requests natively in forward proxy mode. No special configuration is needed beyond enabling the proxy and allowing the relevant ACLs:
-
-```
-# /etc/squid/squid.conf (minimal)
-http_port 3128
-
-# Allow connections from the Worker's egress IP (the tunnel exit node)
-acl worker_src src 172.18.0.0/24
-http_access allow worker_src
-
-# Allow HTTPS destinations via absolute-form (default behaviour)
-http_access deny all
-```
-
-Squid will issue its own TLS connection to the origin when it sees an `https://` request target, returning the decrypted response to the Worker over the plain proxy connection — exactly the same behaviour as FortiGate with `detect-https-in-http-request`.
-
-### tinyproxy ✗ — not compatible
-
-Tinyproxy will not work with this Worker. By design, tinyproxy is a lightweight HTTP proxy that treats HTTPS traffic strictly as an opaque stream via the `CONNECT` method. When it receives `GET https://host/path HTTP/1.1` in absolute-form, it returns `501 Not Implemented` — it has no capability to fetch HTTPS resources itself. The source code confirms this: only `http://` URLs and `CONNECT` requests are handled; everything else falls into a `501` branch.
-
-The `CONNECT`-based approach (which tinyproxy does support) cannot be used here because `env.VPC.connect()` is plaintext-only and `startTls()` is not available on VPC-bound sockets.
-
 ## Known limitations
 
 - **One connection per request** — the Workers runtime ties TCP socket lifetimes to request lifetimes. A new proxy connection is opened for every inbound request; there is no connection pool.
 - **WebSocket upgrades** — requests with an `Upgrade` header are passed through to Gateway's normal egress via `next()` and are not proxied.
-- **Plaintext Worker-to-proxy leg** — `env.VPC.connect()` supports plaintext TCP only. This is acceptable because the FortiGate proxy is on a trusted private LAN and handles the HTTPS leg to the origin itself.
+- **Plaintext Worker-to-proxy leg** — `env.VPC.connect()` supports plaintext TCP only. This is acceptable because the proxy is on a trusted private LAN and handles the HTTPS leg to the origin itself.
 
 ## Credits
 
