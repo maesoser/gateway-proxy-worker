@@ -2,43 +2,38 @@
  * workers-proxy
  *
  * A Cloudflare Gateway middleware Worker that acts as a forward HTTP proxy,
- * routing all traffic through a private network reachable via a Workers VPC
- * Network binding over a Cloudflare Tunnel.
+ * routing all traffic through tinyproxy on a private network reachable via a
+ * Cloudflare Tunnel.
  *
- * It is deployed as a Gateway Custom Action (Programmable Gateway / Gateway
- * Workers). Gateway matches HTTP policy rules, decrypts TLS, and dispatches
- * the plain Request to this Worker's GatewayMiddleware.handle() method.
+ * Protocol:
  *
- * Protocol split:
- *
- *   HTTP  → raw TCP to tinyproxy via env.VPC.connect()
- *           Request: "GET http://host/path HTTP/1.1" (absolute-form)
+ *   HTTP  → global connect() to tinyproxy (plaintext TCP, tunnel-routed)
+ *           "GET http://host/path HTTP/1.1"  (absolute-form)
  *           Tinyproxy forwards to the origin over plain HTTP.
  *
- *   HTTPS → env.VPC.fetch() through the same VPC / Cloudflare Tunnel.
- *           The Workers runtime handles TLS to the origin natively.
- *           Tinyproxy is not involved — but the traffic still routes through
- *           the same private-network tunnel, satisfying the network requirement.
- *           Redirects are followed internally (redirect:"follow") so Gateway
- *           never re-intercepts a 3xx and creates a loop.
+ *   HTTPS → global connect() with secureTransport:"starttls" to tinyproxy
+ *           "CONNECT host:443 HTTP/1.1" → tinyproxy opens TCP to host:443
+ *           socket.startTls() upgrades the socket to TLS through the tunnel
+ *           "GET /path HTTP/1.1" sent in plain through the TLS connection
+ *           Tinyproxy is a transparent byte pipe; Workers runtime does TLS.
  *
- *   Why not send HTTPS through tinyproxy?
- *     - env.VPC.connect() is plaintext-only; startTls() is not available on
- *       VPC-bound sockets, so the Worker cannot do a CONNECT tunnel + TLS.
- *     - Tinyproxy does not transparently fetch https:// absolute-form
- *       requests on behalf of the client; it expects CONNECT for HTTPS.
- *     - Sending GET https://host/path to tinyproxy results in a redirect
- *       loop because tinyproxy redirects to http://, which Gateway
- *       re-intercepts back through the Worker.
+ * Why global connect() and not env.VPC.connect()?
+ *   env.VPC.connect() is plaintext-only — startTls() is not available on
+ *   VPC-bound sockets. The global connect() from cloudflare:sockets supports
+ *   startTls(). Since 172.18.0.0/24 is announced as a subnet route through
+ *   the mad01-k8s tunnel in the default virtual network, the global connect()
+ *   reaches tinyproxy at 172.18.0.22:8888 via Cloudflare's routing — the
+ *   traffic still flows through the same Cloudflare Tunnel.
  *
  * Flow:
  *   Client → Cloudflare Gateway (TLS termination + policy match)
  *     → GatewayMiddleware.handle(request, context, next)
- *       HTTP:  → VPC connect() → Tunnel → tinyproxy → origin
- *       HTTPS: → VPC fetch()   → Tunnel → origin (TLS by Workers runtime)
+ *       HTTP:  connect(proxy) → plaintext → tinyproxy → origin
+ *       HTTPS: connect(proxy, starttls) → CONNECT → startTls() → tinyproxy → origin
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { connect } from "cloudflare:sockets";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -158,6 +153,31 @@ class BufferedReader {
     }
 
     return out;
+  }
+
+  /**
+   * Read bytes until the delimiter sequence is found, returning everything
+   * up to and including the delimiter. Excess bytes are kept in remainder.
+   * Used to read HTTP response headers terminated by \r\n\r\n.
+   */
+  async readUntil(delimiter: Uint8Array): Promise<Uint8Array> {
+    const chunks: Uint8Array[] = this.remainder.length > 0
+      ? [this.remainder]
+      : [];
+    this.remainder = new Uint8Array(0);
+
+    while (true) {
+      const combined = concat(chunks);
+      const idx = indexOfSequence(combined, delimiter);
+      if (idx !== -1) {
+        const end = idx + delimiter.length;
+        this.remainder = combined.subarray(end);
+        return combined.subarray(0, end);
+      }
+      const { done, value } = await this.inner.read();
+      if (done) throw new Error("Proxy: stream ended before delimiter found");
+      chunks.push(value as Uint8Array);
+    }
   }
 
   /**
@@ -283,6 +303,51 @@ async function buildRawRequest(
 }
 
 // ---------------------------------------------------------------------------
+// HTTP CONNECT handshake
+// ---------------------------------------------------------------------------
+
+/**
+ * Send HTTP CONNECT to tinyproxy and wait for "200 Connection established".
+ * After this returns the socket is a transparent TCP pipe to targetHost:targetPort,
+ * ready to be upgraded to TLS with startTls().
+ */
+async function sendHttpConnect(
+  reader: BufferedReader,
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  targetHost: string,
+  targetPort: number,
+  proxyAuth: string | null,
+  log: Logger
+): Promise<void> {
+  const enc = new TextEncoder();
+  const lines = [
+    `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
+    `Host: ${targetHost}:${targetPort}`,
+  ];
+  if (proxyAuth) lines.push(`Proxy-Authorization: Basic ${proxyAuth}`);
+  lines.push("", "");
+
+  log.debug(`CONNECT → ${targetHost}:${targetPort}`);
+  await writer.write(enc.encode(lines.join("\r\n")));
+
+  // Read response up to and including the blank line.
+  const CRLF2 = enc.encode("\r\n\r\n");
+  const responseBytes = await reader.readUntil(CRLF2);
+  const responseText = new TextDecoder("latin1").decode(responseBytes);
+  log.debug(`CONNECT response ←\n${responseText.trimEnd()}`);
+
+  const statusMatch = responseText.match(/^HTTP\/1\.[01] (\d{3})/);
+  if (!statusMatch) {
+    throw new Error(`Proxy: unrecognised CONNECT response: ${responseText.split("\r\n")[0]}`);
+  }
+  const status = parseInt(statusMatch[1], 10);
+  if (status !== 200) {
+    throw new Error(`Proxy: CONNECT failed with status ${status}`);
+  }
+  log.debug("CONNECT tunnel established — ready for TLS upgrade");
+}
+
+// ---------------------------------------------------------------------------
 // Gateway middleware entry point
 // ---------------------------------------------------------------------------
 
@@ -330,56 +395,75 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       : null;
     if (proxyAuth) log.debug("Proxy-Authorization header will be sent");
 
-    // ── HTTPS ────────────────────────────────────────────────────────────────
-    // env.VPC.fetch() routes through the same Cloudflare Tunnel as connect(),
-    // so traffic stays on the private network. The Workers runtime handles TLS
-    // to the origin natively. redirect:"follow" ensures any origin redirects
-    // are resolved internally — Gateway never sees a 3xx and cannot loop.
+    const proxyHost = env.PROXY_HOST;
+    const proxyPort = parseInt(env.PROXY_PORT, 10);
+
     if (isHttps) {
+      // ── HTTPS ───────────────────────────────────────────────────────────────
+      // Use global connect() with secureTransport:"starttls" so we can upgrade
+      // to TLS after the CONNECT handshake. env.VPC.connect() does not support
+      // startTls() — the global connect() does, and 172.18.0.0/24 is routed
+      // through the mad01-k8s tunnel so it reaches tinyproxy the same way.
+      //
+      // Flow:
+      //   1. connect(proxy, starttls) — plain TCP to tinyproxy
+      //   2. CONNECT host:443 — tinyproxy opens TCP to origin:443
+      //   3. "200 Connection established" — tunnel is open
+      //   4. startTls() — Workers runtime does TLS to origin through the tunnel
+      //   5. GET /path HTTP/1.1 — plain HTTP through the TLS connection
+      log.debug(`HTTPS — connect(${proxyHost}:${proxyPort}, starttls) → CONNECT ${targetHost}:${targetPort}`);
+      let plainSocket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array>; startTls(): { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> } };
       try {
-        log.debug("HTTPS — forwarding via env.VPC.fetch() with redirect:follow");
-        const outHeaders = new Headers();
-        for (const [name, value] of request.headers) {
-          if (HOP_BY_HOP.has(name.toLowerCase())) continue;
-          outHeaders.set(name, value);
-        }
-        const upstreamRes = await env.VPC.fetch(url.toString(), {
-          method: request.method,
-          headers: outHeaders,
-          body: request.body,
-          redirect: "follow",
-        });
-        const resHeaders = new Headers();
-        for (const [name, value] of upstreamRes.headers) {
-          if (STRIP_RESPONSE.has(name.toLowerCase())) continue;
-          resHeaders.set(name, value);
-        }
-        const response = new Response(upstreamRes.body, {
-          status: upstreamRes.status,
-          statusText: upstreamRes.statusText,
-          headers: resHeaders,
-        });
+        plainSocket = connect(
+          { hostname: proxyHost, port: proxyPort },
+          { secureTransport: "starttls", allowHalfOpen: true }
+        ) as typeof plainSocket;
+      } catch (err) {
+        log.error(`connect() failed: ${err}`);
+        return new Response("Bad Gateway: could not connect to proxy", { status: 502 });
+      }
+
+      const plainReader = new BufferedReader(plainSocket.readable.getReader());
+      const plainWriter = plainSocket.writable.getWriter();
+
+      try {
+        // Step 1: send CONNECT to tinyproxy
+        await sendHttpConnect(plainReader, plainWriter, targetHost, targetPort, proxyAuth, log);
+
+        // Step 2: upgrade to TLS — Workers runtime performs TLS handshake
+        // with the origin through the transparent tinyproxy tunnel.
+        log.debug("Upgrading socket to TLS via startTls()");
+        const tlsSocket = (plainSocket as any).startTls();
+        const tlsReader = new BufferedReader(tlsSocket.readable.getReader());
+        const tlsWriter = tlsSocket.writable.getWriter();
+
+        // Step 3: send plain HTTP request through the TLS connection
+        const rawRequest = await buildRawRequest(request, url, null, log);
+        log.debug(`Writing ${rawRequest.length} bytes through TLS tunnel`);
+        await tlsWriter.write(rawRequest);
+
+        const responseStream = tlsReader.toReadableStream();
+        log.debug("Parsing HTTPS response");
+        const response = await parseHttpResponse(responseStream, tlsWriter, log);
         log.info(`Response: ${response.status} ${response.statusText}`);
         return response;
       } catch (err) {
-        log.error(`VPC fetch failed: ${err}`);
+        log.error(`HTTPS proxy error: ${err}`);
+        try { plainWriter.close(); } catch { /* ignore */ }
+        try { plainReader.cancel(); } catch { /* ignore */ }
         return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
       }
     }
 
     // ── HTTP ─────────────────────────────────────────────────────────────────
-    // Send an absolute-form GET http://host/path request to tinyproxy over a
-    // raw TCP socket through the VPC tunnel.
-    log.debug(`HTTP — connecting to tinyproxy at ${env.PROXY_HOST}:${env.PROXY_PORT}`);
+    // Send an absolute-form GET http://host/path request to tinyproxy.
+    // Use the global connect() for consistency (env.VPC.connect() also works).
+    log.debug(`HTTP — connect(${proxyHost}:${proxyPort})`);
     let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
     try {
-      socket = await env.VPC.connect({
-        hostname: env.PROXY_HOST,
-        port: parseInt(env.PROXY_PORT, 10),
-      });
-      log.debug("VPC TCP connection established");
+      socket = connect({ hostname: proxyHost, port: proxyPort });
     } catch (err) {
-      log.error(`VPC connect failed: ${err}`);
+      log.error(`connect() failed: ${err}`);
       return new Response("Bad Gateway: could not connect to HTTP proxy", { status: 502 });
     }
     const reader = new BufferedReader(socket.readable.getReader());
@@ -396,7 +480,7 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       log.info(`Response: ${response.status} ${response.statusText}`);
       return response;
     } catch (err) {
-      log.error(`Proxy error: ${err}`);
+      log.error(`HTTP proxy error: ${err}`);
       try { writer.close(); } catch { /* ignore */ }
       try { reader.cancel(); } catch { /* ignore */ }
       return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
@@ -508,6 +592,16 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   let offset = 0;
   for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
   return out;
+}
+
+function indexOfSequence(haystack: Uint8Array, needle: Uint8Array): number {
+  outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
 }
 
 
