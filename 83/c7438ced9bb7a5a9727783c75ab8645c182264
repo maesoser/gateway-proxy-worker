@@ -1,0 +1,19 @@
+README.md
+  s_f95248f9641750::t_4f98ea800e6795 3,20,22,27,34,38,41,45-51,70-86,88-94,100,109,116,164,194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "83c7438ced9bb7a5a9727783c75ab8645c182264",
+  "prompts": {},
+  "sessions": {
+    "s_f95248f9641750": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f1908f115ffe74Nu31Uo6jeNl6",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "Sergio Maeso <sergio@cloudflare.com>"
+    }
+  }
+}
