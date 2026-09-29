@@ -2,38 +2,38 @@
  * workers-proxy
  *
  * A Cloudflare Gateway middleware Worker that acts as a forward HTTP proxy,
- * routing all traffic through tinyproxy on a private network reachable via a
- * Cloudflare Tunnel.
+ * routing all traffic through a FortiGate explicit web proxy on a private
+ * network reachable via a Workers VPC Network binding over a Cloudflare Tunnel.
  *
- * Protocol:
+ * It is deployed as a Gateway Custom Action (Programmable Gateway / Gateway
+ * Workers). Gateway matches HTTP policy rules, decrypts TLS, and dispatches
+ * the plain Request to this Worker's GatewayMiddleware.handle() method.
  *
- *   HTTP  → global connect() to tinyproxy (plaintext TCP, tunnel-routed)
- *           "GET http://host/path HTTP/1.1"  (absolute-form)
- *           Tinyproxy forwards to the origin over plain HTTP.
+ * Protocol — both HTTP and HTTPS use the same absolute-form request path:
  *
- *   HTTPS → global connect() with secureTransport:"starttls" to tinyproxy
- *           "CONNECT host:443 HTTP/1.1" → tinyproxy opens TCP to host:443
- *           socket.startTls() upgrades the socket to TLS through the tunnel
- *           "GET /path HTTP/1.1" sent in plain through the TLS connection
- *           Tinyproxy is a transparent byte pipe; Workers runtime does TLS.
+ *   HTTP:  GET http://host/path HTTP/1.1   → FortiGate forwards over plain HTTP
+ *   HTTPS: GET https://host/path HTTP/1.1  → FortiGate detects the https://
+ *          scheme and opens a TLS connection to the origin itself, returning
+ *          the decrypted response to the Worker over the plain proxy connection.
  *
- * Why global connect() and not env.VPC.connect()?
- *   env.VPC.connect() is plaintext-only — startTls() is not available on
- *   VPC-bound sockets. The global connect() from cloudflare:sockets supports
- *   startTls(). Since 172.18.0.0/24 is announced as a subnet route through
- *   the mad01-k8s tunnel in the default virtual network, the global connect()
- *   reaches tinyproxy at 172.18.0.22:8888 via Cloudflare's routing — the
- *   traffic still flows through the same Cloudflare Tunnel.
+ * This relies on the FortiGate explicit proxy feature:
+ *   config firewall proxy-policy
+ *       set detect-https-in-http-request enable
+ *       set ssl-ssh-profile "deep-inspection"
+ *
+ * The Worker never needs to speak TLS — Gateway decrypts the client's TLS,
+ * and FortiGate handles TLS to the origin. The VPC plaintext-only limitation
+ * of env.VPC.connect() is therefore not a problem.
  *
  * Flow:
  *   Client → Cloudflare Gateway (TLS termination + policy match)
  *     → GatewayMiddleware.handle(request, context, next)
- *       HTTP:  connect(proxy) → plaintext → tinyproxy → origin
- *       HTTPS: connect(proxy, starttls) → CONNECT → startTls() → tinyproxy → origin
+ *       → VPC connect() → Cloudflare Tunnel (mad01-k8s)
+ *         → FortiGate explicit proxy (172.18.0.22:8888)
+ *           → origin (HTTP or HTTPS, TLS handled by FortiGate)
  */
 
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { connect } from "cloudflare:sockets";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -58,12 +58,12 @@ interface VpcNetworkBinding {
 interface Env {
   /** VPC Network binding that routes TCP through the mad01-k8s tunnel */
   VPC: VpcNetworkBinding;
-  /** Hostname or IP of the HTTP proxy reachable behind the tunnel */
+  /** Hostname or IP of the FortiGate explicit proxy reachable behind the tunnel */
   PROXY_HOST: string;
-  /** Port the HTTP proxy listens on */
+  /** Port the proxy listens on */
   PROXY_PORT: string;
   /**
-   * Optional HTTP proxy credentials (Proxy-Authorization: Basic ...).
+   * Optional proxy credentials (Proxy-Authorization: Basic ...).
    * If either is absent the request is sent without a Proxy-Authorization header.
    */
   PROXY_USERNAME?: string;
@@ -113,9 +113,9 @@ function newRequestId(): string {
 /**
  * Stateful buffered reader that wraps a ReadableStreamDefaultReader.
  *
- * HTTP proxies write the CONNECT response header and may include bytes of the
- * tunneled response in the same TCP segment. A naïve readUntil that discards
- * leftover bytes from an oversized chunk would lose those bytes.
+ * HTTP proxies may deliver the response header and the start of the body in
+ * the same TCP segment. A naïve readUntil that discards leftover bytes from
+ * an oversized chunk would lose those bytes.
  *
  * BufferedReader keeps an internal remainder buffer so leftover bytes from
  * one read are preserved and returned by the next call.
@@ -153,31 +153,6 @@ class BufferedReader {
     }
 
     return out;
-  }
-
-  /**
-   * Read bytes until the delimiter sequence is found, returning everything
-   * up to and including the delimiter. Excess bytes are kept in remainder.
-   * Used to read HTTP response headers terminated by \r\n\r\n.
-   */
-  async readUntil(delimiter: Uint8Array): Promise<Uint8Array> {
-    const chunks: Uint8Array[] = this.remainder.length > 0
-      ? [this.remainder]
-      : [];
-    this.remainder = new Uint8Array(0);
-
-    while (true) {
-      const combined = concat(chunks);
-      const idx = indexOfSequence(combined, delimiter);
-      if (idx !== -1) {
-        const end = idx + delimiter.length;
-        this.remainder = combined.subarray(end);
-        return combined.subarray(0, end);
-      }
-      const { done, value } = await this.inner.read();
-      if (done) throw new Error("Proxy: stream ended before delimiter found");
-      chunks.push(value as Uint8Array);
-    }
   }
 
   /**
@@ -256,8 +231,10 @@ const STRIP_RESPONSE = new Set([
 /**
  * Serialise the incoming Request into raw HTTP/1.1 bytes for an HTTP forward
  * proxy. The request-target is always absolute-form (http:// or https://) so
- * the proxy knows where to fetch the resource. Tinyproxy handles TLS to the
- * origin for https:// targets — the Worker never speaks TLS itself.
+ * the proxy knows where to fetch the resource.
+ *
+ * For HTTPS targets, the FortiGate explicit proxy detects the https:// scheme
+ * and handles the TLS connection to the origin itself via detect-https-in-http-request.
  *
  * proxyAuth: base64-encoded "user:pass" for Proxy-Authorization, or null.
  */
@@ -303,51 +280,6 @@ async function buildRawRequest(
 }
 
 // ---------------------------------------------------------------------------
-// HTTP CONNECT handshake
-// ---------------------------------------------------------------------------
-
-/**
- * Send HTTP CONNECT to tinyproxy and wait for "200 Connection established".
- * After this returns the socket is a transparent TCP pipe to targetHost:targetPort,
- * ready to be upgraded to TLS with startTls().
- */
-async function sendHttpConnect(
-  reader: BufferedReader,
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  targetHost: string,
-  targetPort: number,
-  proxyAuth: string | null,
-  log: Logger
-): Promise<void> {
-  const enc = new TextEncoder();
-  const lines = [
-    `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
-    `Host: ${targetHost}:${targetPort}`,
-  ];
-  if (proxyAuth) lines.push(`Proxy-Authorization: Basic ${proxyAuth}`);
-  lines.push("", "");
-
-  log.debug(`CONNECT → ${targetHost}:${targetPort}`);
-  await writer.write(enc.encode(lines.join("\r\n")));
-
-  // Read response up to and including the blank line.
-  const CRLF2 = enc.encode("\r\n\r\n");
-  const responseBytes = await reader.readUntil(CRLF2);
-  const responseText = new TextDecoder("latin1").decode(responseBytes);
-  log.debug(`CONNECT response ←\n${responseText.trimEnd()}`);
-
-  const statusMatch = responseText.match(/^HTTP\/1\.[01] (\d{3})/);
-  if (!statusMatch) {
-    throw new Error(`Proxy: unrecognised CONNECT response: ${responseText.split("\r\n")[0]}`);
-  }
-  const status = parseInt(statusMatch[1], 10);
-  if (status !== 200) {
-    throw new Error(`Proxy: CONNECT failed with status ${status}`);
-  }
-  log.debug("CONNECT tunnel established — ready for TLS upgrade");
-}
-
-// ---------------------------------------------------------------------------
 // Gateway middleware entry point
 // ---------------------------------------------------------------------------
 
@@ -375,8 +307,8 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     log.debug(`Gateway context: ${JSON.stringify(context)}`);
 
     const url = new URL(request.url);
-    const isHttps = url.protocol === "https:";
     const targetHost = url.hostname;
+    const isHttps = url.protocol === "https:";
     const defaultPort = isHttps ? 443 : 80;
     const targetPort = url.port ? parseInt(url.port, 10) : defaultPort;
 
@@ -395,83 +327,33 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       : null;
     if (proxyAuth) log.debug("Proxy-Authorization header will be sent");
 
-    const proxyHost = env.PROXY_HOST;
-    const proxyPort = parseInt(env.PROXY_PORT, 10);
-
-    if (isHttps) {
-      // ── HTTPS ───────────────────────────────────────────────────────────────
-      // Use global connect() with secureTransport:"starttls" so we can upgrade
-      // to TLS after the CONNECT handshake. env.VPC.connect() does not support
-      // startTls() — the global connect() does, and 172.18.0.0/24 is routed
-      // through the mad01-k8s tunnel so it reaches tinyproxy the same way.
-      //
-      // Flow:
-      //   1. connect(proxy, starttls) — plain TCP to tinyproxy
-      //   2. CONNECT host:443 — tinyproxy opens TCP to origin:443
-      //   3. "200 Connection established" — tunnel is open
-      //   4. startTls() — Workers runtime does TLS to origin through the tunnel
-      //   5. GET /path HTTP/1.1 — plain HTTP through the TLS connection
-      log.debug(`HTTPS — connect(${proxyHost}:${proxyPort}, starttls) → CONNECT ${targetHost}:${targetPort}`);
-      let plainSocket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array>; startTls(): { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> } };
-      try {
-        plainSocket = connect(
-          { hostname: proxyHost, port: proxyPort },
-          { secureTransport: "starttls", allowHalfOpen: true }
-        ) as typeof plainSocket;
-      } catch (err) {
-        log.error(`connect() failed: ${err}`);
-        return new Response("Bad Gateway: could not connect to proxy", { status: 502 });
-      }
-
-      const plainReader = new BufferedReader(plainSocket.readable.getReader());
-      const plainWriter = plainSocket.writable.getWriter();
-
-      try {
-        // Step 1: send CONNECT to tinyproxy
-        await sendHttpConnect(plainReader, plainWriter, targetHost, targetPort, proxyAuth, log);
-
-        // Step 2: upgrade to TLS — Workers runtime performs TLS handshake
-        // with the origin through the transparent tinyproxy tunnel.
-        log.debug("Upgrading socket to TLS via startTls()");
-        const tlsSocket = (plainSocket as any).startTls();
-        const tlsReader = new BufferedReader(tlsSocket.readable.getReader());
-        const tlsWriter = tlsSocket.writable.getWriter();
-
-        // Step 3: send plain HTTP request through the TLS connection
-        const rawRequest = await buildRawRequest(request, url, null, log);
-        log.debug(`Writing ${rawRequest.length} bytes through TLS tunnel`);
-        await tlsWriter.write(rawRequest);
-
-        const responseStream = tlsReader.toReadableStream();
-        log.debug("Parsing HTTPS response");
-        const response = await parseHttpResponse(responseStream, tlsWriter, log);
-        log.info(`Response: ${response.status} ${response.statusText}`);
-        return response;
-      } catch (err) {
-        log.error(`HTTPS proxy error: ${err}`);
-        try { plainWriter.close(); } catch { /* ignore */ }
-        try { plainReader.cancel(); } catch { /* ignore */ }
-        return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
-      }
-    }
-
-    // ── HTTP ─────────────────────────────────────────────────────────────────
-    // Send an absolute-form GET http://host/path request to tinyproxy.
-    // Use the global connect() for consistency (env.VPC.connect() also works).
-    log.debug(`HTTP — connect(${proxyHost}:${proxyPort})`);
+    // Open a raw TCP connection to the proxy through the VPC tunnel.
+    log.debug(`Connecting to proxy at ${env.PROXY_HOST}:${env.PROXY_PORT} via VPC`);
     let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
     try {
-      socket = connect({ hostname: proxyHost, port: proxyPort });
+      socket = await env.VPC.connect({
+        hostname: env.PROXY_HOST,
+        port: parseInt(env.PROXY_PORT, 10),
+      });
+      log.debug("VPC TCP connection established");
     } catch (err) {
-      log.error(`connect() failed: ${err}`);
-      return new Response("Bad Gateway: could not connect to HTTP proxy", { status: 502 });
+      log.error(`VPC connect failed: ${err}`);
+      return new Response("Bad Gateway: could not connect to proxy", { status: 502 });
     }
+
     const reader = new BufferedReader(socket.readable.getReader());
     const writer = socket.writable.getWriter();
 
     try {
+      // Send an absolute-form request to the proxy for both HTTP and HTTPS.
+      //
+      // For HTTP:  GET http://host/path HTTP/1.1  — proxy forwards over HTTP.
+      // For HTTPS: GET https://host/path HTTP/1.1 — FortiGate's
+      //   detect-https-in-http-request detects the https:// scheme and opens
+      //   a TLS connection to the origin itself, returning the response to
+      //   the Worker over the plain proxy connection.
       const rawRequest = await buildRawRequest(request, url, proxyAuth, log);
-      log.debug(`Writing ${rawRequest.length} bytes to tinyproxy`);
+      log.debug(`Writing ${rawRequest.length} bytes to proxy (${isHttps ? "HTTPS absolute-form" : "HTTP absolute-form"})`);
       await writer.write(rawRequest);
 
       const responseStream = reader.toReadableStream();
@@ -480,7 +362,7 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
       log.info(`Response: ${response.status} ${response.statusText}`);
       return response;
     } catch (err) {
-      log.error(`HTTP proxy error: ${err}`);
+      log.error(`Proxy error: ${err}`);
       try { writer.close(); } catch { /* ignore */ }
       try { reader.cancel(); } catch { /* ignore */ }
       return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
@@ -593,15 +475,3 @@ function concat(chunks: Uint8Array[]): Uint8Array {
   for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
   return out;
 }
-
-function indexOfSequence(haystack: Uint8Array, needle: Uint8Array): number {
-  outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
-    for (let j = 0; j < needle.length; j++) {
-      if (haystack[i + j] !== needle[j]) continue outer;
-    }
-    return i;
-  }
-  return -1;
-}
-
-
