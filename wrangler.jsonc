@@ -17,7 +17,10 @@
   "vars": {
     "PROXY_HOST": "172.18.0.22",
     "PROXY_PORT": "8888",
-    "DEBUG": "true"
+    "DEBUG": "true",
+    // When "true": if the proxy is unreachable before the request body is consumed,
+    // the request falls through to Gateway's normal egress instead of returning 502.
+    "FAIL_OPEN": "false"
   },
 
   // PROXY_USERNAME and PROXY_PASSWORD are optional secrets.

@@ -4,10 +4,14 @@ Context and guidance for AI coding agents working on this repository.
 
 ## What this project does
 
-`workers-proxy` is a Cloudflare Worker that acts as a **forward HTTP proxy**. Its sole job is to accept an inbound HTTP/HTTPS request and relay it to the target origin through a **SOCKS5 proxy** that lives on a private network, using a [Workers VPC Network](https://developers.cloudflare.com/workers-vpc/configuration/vpc-networks/) binding to reach that network through a Cloudflare Tunnel.
+`workers-proxy` is a Cloudflare Worker deployed as a **Gateway Custom Action** middleware. It acts as a forward HTTP proxy, routing all traffic through a **FortiGate explicit web proxy** that lives on a private network, reachable via a [Workers VPC Network](https://developers.cloudflare.com/workers-vpc/configuration/vpc-networks/) binding over a Cloudflare Tunnel.
 
 ```
-Client → Cloudflare edge (TLS termination) → Worker → VPC binding → Cloudflare Tunnel → SOCKS5 proxy → Target
+Client → Cloudflare Gateway (TLS termination + policy match)
+  → GatewayMiddleware.handle(request, context, next)
+    → VPC connect() → Cloudflare Tunnel (mad01-k8s)
+      → FortiGate explicit proxy (172.18.0.22:8888)
+        → origin (HTTP or HTTPS, TLS handled by FortiGate)
 ```
 
 ## Repository layout
@@ -15,7 +19,7 @@ Client → Cloudflare edge (TLS termination) → Worker → VPC binding → Clou
 ```
 workers-proxy/
 ├── src/
-│   └── index.ts          # Entire Worker — SOCKS5 client + HTTP proxy logic
+│   └── index.ts          # Entire Worker — proxy logic
 ├── wrangler.jsonc         # Wrangler config: VPC binding, vars, observability
 ├── tsconfig.json          # TypeScript config (no emit, strict)
 ├── package.json           # npm scripts: dev, deploy, typecheck, logs
@@ -26,82 +30,107 @@ workers-proxy/
 
 ## Key design decisions
 
-### Why SOCKS5 and not a plain TCP forward?
+### Protocol: absolute-form for both HTTP and HTTPS
 
-The SOCKS5 proxy already exists on the private network and handles routing, DNS resolution, and upstream TLS for the target. The Worker only needs to speak SOCKS5 to it — it does not need to manage any outbound TLS itself.
+Both HTTP and HTTPS requests are forwarded as absolute-form HTTP proxy requests:
 
-### Why not use `env.VPC.fetch()` instead of `connect()`?
+```
+GET http://example.com/path  HTTP/1.1   ← HTTP
+GET https://example.com/path HTTP/1.1   ← HTTPS
+```
 
-`fetch()` on a VPC binding routes HTTP requests directly to a known host registered as a VPC Service. Here the destination is **dynamic** (chosen per-request from the inbound URL) and the intermediary is a SOCKS5 proxy, which requires a raw TCP connection and a binary handshake. `connect()` is the correct primitive.
+The FortiGate explicit proxy handles HTTPS via `detect-https-in-http-request` — it detects the `https://` scheme and opens a TLS connection to the origin itself. The Worker never needs to speak TLS.
 
-### How HTTPS works
+### Why not CONNECT tunneling?
 
-Cloudflare terminates TLS at the edge before the Worker ever runs. The Worker always receives a plain, decrypted `Request` object regardless of whether the client used HTTP or HTTPS. No TLS handling is needed inside the Worker.
+`env.VPC.connect()` is plaintext TCP only — `startTls()` is not available on VPC-bound sockets. CONNECT would require the Worker to do TLS through the tunnel, which is impossible. The FortiGate `detect-https-in-http-request` feature solves this entirely at the proxy level.
+
+### Why not `env.VPC.fetch()`?
+
+`env.VPC.fetch()` bypasses the proxy entirely — it routes directly through the Cloudflare Tunnel to the origin. All traffic must pass through the FortiGate proxy.
+
+### Request body streaming
+
+Bodies are streamed as chunked transfer-encoding when `Content-Length` is unknown. This avoids buffering large uploads in Worker memory (`arrayBuffer()` would break for large files).
+
+### Response body framing
+
+The Worker correctly handles all three HTTP/1.1 body framing modes: chunked, fixed-length, and until-close. This avoids truncation or decode errors that occur when body framing headers are stripped without proper handling.
+
+### FAIL_OPEN
+
+When `FAIL_OPEN=true`, proxy TCP connect failures fall through to `next(request)` (Gateway's normal egress) provided the request body has not yet been consumed. This prevents a proxy outage from hard-blocking all traffic.
 
 ### One socket per request
 
-The Workers runtime ties TCP socket lifetimes to request lifetimes. There is no persistent connection pool. A new SOCKS5 connection is opened for every inbound request.
+The Workers runtime ties TCP socket lifetimes to request lifetimes. There is no persistent connection pool. A new proxy connection is opened for every inbound request.
 
 ## Source code structure (`src/index.ts`)
-
-The file is divided into clearly labelled sections:
 
 | Section | What it contains |
 |---|---|
 | **Types** | `VpcNetworkBinding`, `Env` interfaces |
 | **Logger** | `makeLogger()`, `newRequestId()` — per-request, zero-cost when `DEBUG != "true"` |
-| **SOCKS5 constants** | RFC 1928/1929 byte values |
-| **Low-level helpers** | `readExactly()`, `hex()` |
-| **SOCKS5 handshake** | `socks5Connect()` — greeting, auth, CONNECT, reply parsing |
-| **HTTP serialisation** | `buildHttpRequest()` — constructs the raw HTTP/1.1 request bytes |
-| **Stream helpers** | `readerToReadableStream()` — wraps a locked reader back into a `ReadableStream` |
-| **Main handler** | `export default { fetch }` |
-| **HTTP response parser** | `parseHttpResponse()` — buffers until `\r\n\r\n`, extracts status + headers, streams body |
-| **Utility** | `concat()` |
+| **Constants** | `ENC`, `DEC`, `CRLF`, `CRLFCRLF`, `MAX_HEADER_BYTES` |
+| **BufferedReader** | Stateful reader that preserves bytes across reads; used for response header and body parsing |
+| **Header sets** | `REQUEST_STRIP`, `RESPONSE_STRIP` — hop-by-hop and Cloudflare-internal headers |
+| **sendRequest()** | Serialises and streams the HTTP request into the proxy socket; handles chunked encoding |
+| **readResponse()** | Parses status + headers; dispatches to `chunkedBody`, `lengthBody`, or `untilCloseBody` |
+| **Body helpers** | `chunkedBody()`, `lengthBody()`, `untilCloseBody()` — three response body framing modes |
+| **GatewayMiddleware** | `export class GatewayMiddleware extends WorkerEntrypoint<Env>` — the Gateway contract entry point |
 
 ## Environment bindings
 
 | Binding | Type | Purpose |
 |---|---|---|
 | `VPC` | VPC Network | Routes `connect()` through the `mad01-k8s` Cloudflare Tunnel |
-| `SOCKS5_HOST` | var | IP/hostname of the SOCKS5 proxy (`172.18.0.21`) |
-| `SOCKS5_PORT` | var | Port of the SOCKS5 proxy (`1080`) |
-| `SOCKS5_USERNAME` | secret | RFC 1929 username |
-| `SOCKS5_PASSWORD` | secret | RFC 1929 password |
+| `PROXY_HOST` | var | IP/hostname of the FortiGate explicit proxy (`172.18.0.22`) |
+| `PROXY_PORT` | var | Port of the proxy (`8888`) |
+| `PROXY_USERNAME` | secret (optional) | HTTP proxy username for `Proxy-Authorization: Basic` |
+| `PROXY_PASSWORD` | secret (optional) | HTTP proxy password |
+| `FAIL_OPEN` | var | `"true"` falls through to Gateway egress on proxy connect failure |
 | `DEBUG` | var | `"true"` enables verbose logging; anything else disables it |
 
-`SOCKS5_USERNAME` and `SOCKS5_PASSWORD` are Wrangler secrets — encrypted at rest, never appear in `wrangler.jsonc` or logs. Credentials must never be logged. The auth debug line logs only the byte lengths (`ULEN`, `PLEN`), not the values.
+`PROXY_USERNAME` and `PROXY_PASSWORD` are optional Wrangler secrets — if absent, requests are sent without a `Proxy-Authorization` header. Credentials must never be logged.
 
 ## Where to make changes
 
-### Changing the SOCKS5 proxy address
+### Changing the proxy address or port
 
-Update `SOCKS5_HOST` and/or `SOCKS5_PORT` in the `vars` block of `wrangler.jsonc`, then `wrangler deploy`.
+Update `PROXY_HOST` and/or `PROXY_PORT` in the `vars` block of `wrangler.jsonc`, then `wrangler deploy`.
 
 ### Changing the Cloudflare Tunnel
 
 Update `tunnel_id` in the `vpc_networks` block of `wrangler.jsonc`, then `wrangler deploy`.
 
-### Adding SOCKS5 username/password auth changes
+### Enabling proxy authentication
 
-The auth logic is in `socks5Connect()` in `src/index.ts`, in the block guarded by `methodResponse[1] === METHOD_USERNAME_PASSWORD`. The RFC 1929 frame layout is:
-
+```bash
+printf 'user' | wrangler secret put PROXY_USERNAME
+printf 'pass' | wrangler secret put PROXY_PASSWORD
+wrangler deploy
 ```
-VER(0x01) | ULEN(1 byte) | UNAME(ULEN bytes) | PLEN(1 byte) | PASSWD(PLEN bytes)
-```
 
-### Turning debug logging off for production
+### Disabling debug logging for production
 
-Set `"DEBUG": "false"` (or any value other than `"true"`) in `wrangler.jsonc` → `vars`, then redeploy. `log.debug()` and `log.info()` become no-ops with zero runtime overhead. `log.error()` always emits regardless.
+Set `"DEBUG": "false"` in `wrangler.jsonc` → `vars`, then redeploy. `log.debug()` and `log.info()` become no-ops with zero runtime overhead. `log.error()` always emits.
 
-### Adding worker-level authentication
+### Enabling FAIL_OPEN
 
-The `fetch` handler in `src/index.ts` is the right place. Check a `Proxy-Authorization` header or an `Authorization` header before opening the VPC socket. Return `407 Proxy Authentication Required` on failure.
+Set `"FAIL_OPEN": "true"` in `wrangler.jsonc` → `vars`, then redeploy. On proxy TCP connect failure, requests with unconsumed bodies fall through to Gateway's normal egress.
+
+### Adding request/response header manipulation
+
+Add to `REQUEST_STRIP` to drop additional outbound headers, or to `RESPONSE_STRIP` for response headers. Both sets are applied before forwarding.
+
+### Modifying response body handling
+
+The three body framing modes are in `chunkedBody()`, `lengthBody()`, and `untilCloseBody()`. `readResponse()` selects among them based on `Transfer-Encoding` and `Content-Length` headers.
 
 ## Common commands
 
 ```bash
-npm run typecheck    # tsc --noEmit (no deploy)
+npm run typecheck    # tsc --noEmit
 npm run dev          # wrangler dev
 npm run deploy       # wrangler deploy
 npm run logs         # wrangler tail (live log stream)
@@ -111,7 +140,9 @@ wrangler types       # regenerate worker-configuration.d.ts after wrangler.jsonc
 ## What not to do
 
 - Do not add `node_modules/`, `.wrangler/`, or `.dev.vars` to version control.
-- Do not log `SOCKS5_USERNAME` or `SOCKS5_PASSWORD` values anywhere.
-- Do not close the writer immediately after writing the HTTP request — some origins stream responses before they finish reading the request body.
+- Do not log `PROXY_USERNAME` or `PROXY_PASSWORD` values anywhere.
+- Do not buffer request bodies with `arrayBuffer()` — use streaming (chunked encoding) to support large uploads.
+- Do not strip `transfer-encoding` from responses without properly decoding the body first — pass it through `chunkedBody()`.
 - Do not create TCP sockets in module-level / global scope — the Workers runtime requires sockets to be created inside a handler.
 - Do not edit `worker-configuration.d.ts` by hand — it is generated by `wrangler types`.
+- Do not call `next()` after the request body stream has been partially consumed — it cannot be replayed.

@@ -11,15 +11,17 @@
  *
  * Protocol — both HTTP and HTTPS use the same absolute-form request path:
  *
- *   HTTP:  GET http://host/path HTTP/1.1   → FortiGate forwards over plain HTTP
- *   HTTPS: GET https://host/path HTTP/1.1  → FortiGate detects the https://
- *          scheme and opens a TLS connection to the origin itself, returning
- *          the decrypted response to the Worker over the plain proxy connection.
+ *   HTTP:  GET http://host/path HTTP/1.1
+ *          → FortiGate forwards to the origin over plain HTTP.
  *
- * This relies on the FortiGate explicit proxy feature:
- *   config firewall proxy-policy
- *       set detect-https-in-http-request enable
- *       set ssl-ssh-profile "deep-inspection"
+ *   HTTPS: GET https://host/path HTTP/1.1
+ *          → FortiGate's detect-https-in-http-request detects the https://
+ *            scheme and opens a TLS connection to the origin itself, returning
+ *            the decrypted response to the Worker over the plain proxy connection.
+ *
+ * Required FortiGate proxy-policy config:
+ *   set detect-https-in-http-request enable
+ *   set ssl-ssh-profile "deep-inspection"
  *
  * The Worker never needs to speak TLS — Gateway decrypts the client's TLS,
  * and FortiGate handles TLS to the origin. The VPC plaintext-only limitation
@@ -68,6 +70,12 @@ interface Env {
    */
   PROXY_USERNAME?: string;
   PROXY_PASSWORD?: string;
+  /**
+   * When "true", if the proxy is unreachable and the request body has not yet
+   * been consumed, the request falls through to Gateway's normal egress via
+   * next() instead of returning a 502.
+   */
+  FAIL_OPEN?: string;
   /** Set to "true" to enable verbose debug logging via wrangler tail */
   DEBUG: string;
 }
@@ -107,176 +115,421 @@ function newRequestId(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Low-level helpers
+// Constants
+// ---------------------------------------------------------------------------
+
+const ENC = new TextEncoder();
+const DEC = new TextDecoder();
+const CRLF = ENC.encode("\r\n");
+const CRLFCRLF = ENC.encode("\r\n\r\n");
+const MAX_HEADER_BYTES = 64 * 1024;
+
+// ---------------------------------------------------------------------------
+// BufferedReader
 // ---------------------------------------------------------------------------
 
 /**
- * Stateful buffered reader that wraps a ReadableStreamDefaultReader.
+ * Stateful buffered reader wrapping a ReadableStreamDefaultReader.
  *
- * HTTP proxies may deliver the response header and the start of the body in
- * the same TCP segment. A naïve readUntil that discards leftover bytes from
- * an oversized chunk would lose those bytes.
- *
- * BufferedReader keeps an internal remainder buffer so leftover bytes from
- * one read are preserved and returned by the next call.
+ * Preserves leftover bytes across reads so that oversized chunks (e.g. a TCP
+ * segment delivering both the response header and the start of the body) never
+ * cause bytes to be silently discarded.
  */
 class BufferedReader {
-  private remainder: Uint8Array = new Uint8Array(0);
+  private buf: Uint8Array = new Uint8Array(0);
+  private eof = false;
 
   constructor(private inner: ReadableStreamDefaultReader<Uint8Array>) {}
 
-  /** Read exactly n bytes, preserving any excess in the remainder buffer. */
-  async readExactly(n: number): Promise<Uint8Array> {
-    const out = new Uint8Array(n);
-    let offset = 0;
-
-    if (this.remainder.length > 0) {
-      const take = Math.min(this.remainder.length, n);
-      out.set(this.remainder.subarray(0, take), 0);
-      offset += take;
-      this.remainder = this.remainder.subarray(take);
-    }
-
-    while (offset < n) {
-      const { done, value } = await this.inner.read();
-      if (done) throw new Error(`Proxy: stream ended after ${offset}/${n} bytes`);
-      const chunk = value as Uint8Array;
-      const needed = n - offset;
-      if (chunk.length <= needed) {
-        out.set(chunk, offset);
-        offset += chunk.length;
+  private async fill(): Promise<boolean> {
+    if (this.eof) return false;
+    const { done, value } = await this.inner.read();
+    if (done) { this.eof = true; return false; }
+    if (value && value.byteLength > 0) {
+      if (this.buf.byteLength === 0) {
+        this.buf = value;
       } else {
-        out.set(chunk.subarray(0, needed), offset);
-        offset += needed;
-        this.remainder = chunk.subarray(needed);
+        const merged = new Uint8Array(this.buf.byteLength + value.byteLength);
+        merged.set(this.buf, 0);
+        merged.set(value, this.buf.byteLength);
+        this.buf = merged;
       }
     }
-
-    return out;
+    return true;
   }
 
   /**
-   * Convert the remaining unread data + underlying reader back into a
-   * ReadableStream, for handing off to the HTTP response parser.
+   * Read bytes up to and including `delim`, returning everything before it.
+   * Returns null on EOF before the delimiter is found.
+   * Throws if more than `max` bytes are buffered without finding the delimiter.
    */
-  toReadableStream(): ReadableStream<Uint8Array> {
-    const remainder = this.remainder;
-    const inner = this.inner;
-    return new ReadableStream<Uint8Array>({
-      async start(controller) {
-        if (remainder.length > 0) controller.enqueue(remainder);
-      },
-      async pull(controller) {
-        const { done, value } = await inner.read();
-        if (done) {
-          controller.close();
-        } else {
-          controller.enqueue(value as Uint8Array);
-        }
-      },
-      cancel() { inner.cancel(); },
-    });
+  async readUntil(delim: Uint8Array, max: number): Promise<Uint8Array | null> {
+    let from = 0;
+    for (;;) {
+      const idx = indexOf(this.buf, delim, from);
+      if (idx >= 0) {
+        const out = this.buf.subarray(0, idx);
+        this.buf = this.buf.subarray(idx + delim.byteLength);
+        return out;
+      }
+      if (this.buf.byteLength > max + delim.byteLength) {
+        throw new Error("response header too large");
+      }
+      from = Math.max(0, this.buf.byteLength - delim.byteLength + 1);
+      if (!await this.fill()) return null;
+    }
   }
 
-  cancel(): void { this.inner.cancel(); }
+  /** Return up to `max` bytes, or null on EOF. */
+  async readSome(max: number): Promise<Uint8Array | null> {
+    if (this.buf.byteLength === 0 && !await this.fill()) return null;
+    if (this.buf.byteLength === 0) return this.readSome(max);
+    const n = Math.min(max, this.buf.byteLength);
+    const out = this.buf.subarray(0, n);
+    this.buf = this.buf.subarray(n);
+    return out;
+  }
+
+  cancel(): void { this.inner.cancel().catch(() => {}); }
+}
+
+function indexOf(hay: Uint8Array, needle: Uint8Array, from: number): number {
+  outer: for (let i = from; i <= hay.byteLength - needle.byteLength; i++) {
+    for (let j = 0; j < needle.byteLength; j++) {
+      if (hay[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
 }
 
 // ---------------------------------------------------------------------------
 // Header sets
 // ---------------------------------------------------------------------------
 
-/** Headers stripped from outgoing requests to the upstream. */
-const HOP_BY_HOP = new Set([
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "proxy-connection",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-  // Gateway decrypts TLS and may decode the body before the Worker sees it.
-  // Forwarding accept-encoding would cause the origin to compress the body
-  // and set Content-Encoding, which would then fail to decode in the browser.
-  "accept-encoding",
+/**
+ * Headers stripped from outgoing requests.
+ *
+ * Hop-by-hop headers must not cross a proxy boundary.
+ * Cloudflare-internal headers are stripped because Cloudflare-fronted origins
+ * reject requests that carry them (403), and they would leak Worker metadata.
+ * accept-encoding is stripped because Gateway may have already decoded the
+ * body; forwarding it would cause the origin to compress a response that
+ * the Worker then passes through undecoded, breaking the browser.
+ */
+const REQUEST_STRIP = new Set([
+  "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
+  "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
+  "expect", "host", "accept-encoding",
+  // Cloudflare-reserved — Cloudflare-fronted origins reject these with 403
+  "cf-connecting-ip", "cf-connecting-ipv6", "cf-ipcountry", "cf-ray",
+  "cf-visitor", "cf-worker", "cf-ew-via", "cdn-loop", "x-real-ip",
 ]);
 
 /**
- * Headers stripped from upstream responses before returning to the client.
+ * Headers stripped from upstream responses.
  *
- * Gateway decrypts TLS and may decode compressed bodies before the Worker
- * receives them. Forwarding Content-Encoding unchanged causes the browser to
- * try to decompress an already-decoded body → ERR_CONTENT_DECODING_FAILED.
- * Content-Length is removed because decoded length ≠ compressed length.
+ * content-encoding and content-length are removed because Gateway may have
+ * decoded the body before dispatching to the Worker; forwarding them unchanged
+ * causes ERR_CONTENT_DECODING_FAILED or body truncation in the browser.
+ * Transfer-encoding is managed by the Worker's own body framing logic.
  */
-const STRIP_RESPONSE = new Set([
-  "content-encoding",
-  "content-length",
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "proxy-connection",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
+const RESPONSE_STRIP = new Set([
+  "connection", "keep-alive", "proxy-connection", "proxy-authenticate",
+  "transfer-encoding", "trailer", "upgrade",
+  "content-encoding", "content-length",
 ]);
 
 // ---------------------------------------------------------------------------
-// HTTP request serialisation
+// Request serialisation
 // ---------------------------------------------------------------------------
 
 /**
- * Serialise the incoming Request into raw HTTP/1.1 bytes for an HTTP forward
- * proxy. The request-target is always absolute-form (http:// or https://) so
- * the proxy knows where to fetch the resource.
+ * Write the HTTP request headers and body into the proxy socket stream.
  *
- * For HTTPS targets, the FortiGate explicit proxy detects the https:// scheme
- * and handles the TLS connection to the origin itself via detect-https-in-http-request.
+ * The request-target is always absolute-form (http:// or https://) so the
+ * proxy knows where to fetch the resource. For HTTPS targets the FortiGate
+ * explicit proxy detects the scheme and opens a TLS connection to the origin.
  *
- * proxyAuth: base64-encoded "user:pass" for Proxy-Authorization, or null.
+ * Bodies are streamed as chunked transfer-encoding when no Content-Length is
+ * available, avoiding the need to buffer the entire body in memory.
  */
-async function buildRawRequest(
+async function sendRequest(
+  socket: { writable: WritableStream<Uint8Array> },
   request: Request,
   url: URL,
   proxyAuth: string | null,
   log: Logger
-): Promise<Uint8Array> {
-  const lines: string[] = [];
-  lines.push(`${request.method} ${url.toString()} HTTP/1.1`);
-  lines.push(`Host: ${url.hostname}${url.port ? ":" + url.port : ""}`);
+): Promise<void> {
+  // Collect connection-token header names to also strip (RFC 7230 §6.1)
+  const connectionTokens = new Set(
+    (request.headers.get("connection") ?? "")
+      .split(",").map(t => t.trim().toLowerCase()).filter(Boolean)
+  );
 
-  if (proxyAuth) {
-    lines.push(`Proxy-Authorization: Basic ${proxyAuth}`);
-  }
-
+  const headers = new Headers();
   for (const [name, value] of request.headers) {
-    if (HOP_BY_HOP.has(name.toLowerCase())) {
-      log.debug(`Dropping hop-by-hop header: ${name}`);
+    const lower = name.toLowerCase();
+    if (REQUEST_STRIP.has(lower) || connectionTokens.has(lower)) {
+      log.debug(`Dropping request header: ${name}`);
       continue;
     }
-    lines.push(`${name}: ${value}`);
+    headers.set(name, value);
   }
 
-  lines.push("Connection: close");
-  lines.push("", "");
+  const hasBody = hasRequestBody(request);
+  const body = hasBody ? request.body : null;
+  if (!body) headers.delete("content-length");
 
-  log.debug(`Request line: ${lines[0]}`);
-
-  const headerBytes = new TextEncoder().encode(lines.join("\r\n"));
-
-  if (request.body) {
-    const bodyBytes = new Uint8Array(await request.arrayBuffer());
-    log.debug(`Request body: ${bodyBytes.length} bytes`);
-    const combined = new Uint8Array(headerBytes.length + bodyBytes.length);
-    combined.set(headerBytes, 0);
-    combined.set(bodyBytes, headerBytes.length);
-    return combined;
+  let chunked = false;
+  if (body) {
+    if (!headers.has("content-length")) {
+      chunked = true;
+      headers.set("transfer-encoding", "chunked");
+      log.debug("Request body: streaming as chunked transfer-encoding");
+    } else {
+      log.debug(`Request body: ${headers.get("content-length")} bytes (content-length known)`);
+    }
+  } else if (["POST", "PUT", "PATCH"].includes(request.method.toUpperCase())) {
+    headers.set("content-length", "0");
   }
 
-  return headerBytes;
+  headers.set("connection", "close");
+  if (proxyAuth) headers.set("proxy-authorization", `Basic ${proxyAuth}`);
+
+  // Absolute-form request target
+  const requestTarget = `${url.protocol}//${url.host}${url.pathname || "/"}${url.search}`;
+  let head = `${request.method} ${requestTarget} HTTP/1.1\r\nHost: ${url.host}\r\n`;
+  for (const [name, value] of headers) head += `${name}: ${value}\r\n`;
+  head += "\r\n";
+
+  log.debug(`Request line: ${request.method} ${requestTarget} HTTP/1.1`);
+
+  const writer = socket.writable.getWriter();
+  try {
+    await writer.write(ENC.encode(head));
+
+    if (!body) return;
+
+    const reader = body.getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      if (chunked) {
+        await writer.write(ENC.encode(`${value.byteLength.toString(16)}\r\n`));
+        await writer.write(value);
+        await writer.write(CRLF);
+      } else {
+        await writer.write(value);
+      }
+    }
+    if (chunked) await writer.write(ENC.encode("0\r\n\r\n"));
+  } finally {
+    writer.releaseLock();
+  }
+}
+
+/** True if the request is expected to carry a body. */
+const BODYLESS_METHODS = new Set(["GET", "HEAD", "OPTIONS", "DELETE", "TRACE"]);
+
+function hasRequestBody(request: Request): boolean {
+  if (!request.body) return false;
+  const cl = request.headers.get("content-length");
+  if (cl !== null) return cl.trim() !== "0";
+  if (request.headers.has("transfer-encoding")) return true;
+  return !BODYLESS_METHODS.has(request.method.toUpperCase());
+}
+
+// ---------------------------------------------------------------------------
+// Response parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Read and parse the HTTP/1.1 response from the proxy socket.
+ *
+ * Handles all three HTTP/1.1 body framing modes:
+ *   - chunked transfer-encoding  → decoded chunk by chunk
+ *   - known content-length       → exactly N bytes read via FixedLengthStream
+ *   - until-close                → reads until socket EOF
+ *
+ * 1xx informational responses are skipped until a final ≥200 status arrives.
+ */
+async function readResponse(
+  socket: { readable: ReadableStream<Uint8Array>; close(): Promise<void> },
+  method: string,
+  log: Logger
+): Promise<Response> {
+  const br = new BufferedReader(socket.readable.getReader());
+
+  const cleanup = () => { br.cancel(); socket.close().catch(() => {}); };
+
+  // Skip 1xx informational responses
+  let status!: number;
+  let statusText!: string;
+  let lines!: string[];
+
+  for (;;) {
+    const headBytes = await br.readUntil(CRLFCRLF, MAX_HEADER_BYTES);
+    if (headBytes === null) {
+      throw new Error("proxy upstream closed connection before sending a response");
+    }
+    lines = DEC.decode(headBytes).split("\r\n");
+    ({ status, statusText } = parseStatusLine(lines[0]));
+    log.debug(`Response status: ${status} ${statusText}`);
+    if (status === 101) throw new Error("protocol upgrades are not supported");
+    if (status >= 200) break;
+    // 1xx — loop and read the next response block
+  }
+
+  // Parse response headers
+  const rawHeaders = new Headers();
+  for (const line of lines.slice(1)) {
+    const i = line.indexOf(":");
+    if (i <= 0) continue;
+    rawHeaders.append(line.slice(0, i).trim(), line.slice(i + 1).trim());
+  }
+
+  log.debug(`Response headers:\n${lines.slice(1).filter(l => l).join("\n")}`);
+
+  const connectionTokens = new Set(
+    (rawHeaders.get("connection") ?? "")
+      .split(",").map(t => t.trim().toLowerCase()).filter(Boolean)
+  );
+  const transferEncoding = (rawHeaders.get("transfer-encoding") ?? "").toLowerCase();
+  const contentLength = rawHeaders.get("content-length");
+
+  // Build filtered response headers
+  const responseHeaders = new Headers();
+  for (const [name, value] of rawHeaders) {
+    const lower = name.toLowerCase();
+    if (RESPONSE_STRIP.has(lower) || connectionTokens.has(lower)) {
+      log.debug(`Dropping response header: ${name}`);
+      continue;
+    }
+    // Preserve multiple Set-Cookie headers correctly
+    if (lower === "set-cookie") responseHeaders.append(name, value);
+    else responseHeaders.set(name, value);
+  }
+
+  const noBody = method.toUpperCase() === "HEAD" || status === 204 || status === 304;
+  const safeStatus = status >= 200 && status <= 599 ? status : 502;
+  const init: ResponseInit & { encodeBody: "manual" } = {
+    status: safeStatus,
+    statusText,
+    headers: responseHeaders,
+    encodeBody: "manual",
+  };
+
+  if (noBody) {
+    cleanup();
+    return new Response(null, init);
+  }
+
+  let body: ReadableStream<Uint8Array>;
+
+  if (transferEncoding.includes("chunked")) {
+    log.debug("Response body: chunked transfer-encoding");
+    responseHeaders.delete("content-length");
+    body = chunkedBody(br, cleanup);
+  } else if (contentLength !== null && /^\d+$/.test(contentLength.trim())) {
+    const length = Number(contentLength.trim());
+    log.debug(`Response body: fixed length ${length} bytes`);
+    responseHeaders.delete("content-length");
+    const fixed = new FixedLengthStream(length);
+    lengthBody(br, length, cleanup).pipeTo(fixed.writable).catch(() => cleanup());
+    body = fixed.readable;
+  } else {
+    log.debug("Response body: streaming until connection close");
+    responseHeaders.delete("content-length");
+    body = untilCloseBody(br, cleanup);
+  }
+
+  return new Response(body, init);
+}
+
+function parseStatusLine(line: string): { status: number; statusText: string } {
+  const m = /^HTTP\/\d(?:\.\d)?\s+(\d{3})(?:\s+(.*))?$/.exec(line.trim());
+  if (!m) throw new Error(`malformed status line: ${JSON.stringify(line.slice(0, 100))}`);
+  return { status: Number(m[1]), statusText: m[2] ?? "" };
+}
+
+/** Stream a fixed-length response body. */
+function lengthBody(
+  br: BufferedReader,
+  length: number,
+  cleanup: () => void
+): ReadableStream<Uint8Array> {
+  let remaining = length;
+  return new ReadableStream({
+    async pull(controller) {
+      if (remaining === 0) { controller.close(); cleanup(); return; }
+      const chunk = await br.readSome(remaining);
+      if (chunk === null) {
+        cleanup();
+        controller.error(new Error(`upstream closed with ${remaining} bytes remaining`));
+        return;
+      }
+      remaining -= chunk.byteLength;
+      controller.enqueue(chunk);
+      if (remaining === 0) { controller.close(); cleanup(); }
+    },
+    cancel: cleanup,
+  });
+}
+
+/** Stream a response body until the connection closes. */
+function untilCloseBody(
+  br: BufferedReader,
+  cleanup: () => void
+): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    async pull(controller) {
+      const chunk = await br.readSome(64 * 1024);
+      if (chunk === null) { controller.close(); cleanup(); return; }
+      controller.enqueue(chunk);
+    },
+    cancel: cleanup,
+  });
+}
+
+/** Decode a chunked transfer-encoding response body. */
+function chunkedBody(
+  br: BufferedReader,
+  cleanup: () => void
+): ReadableStream<Uint8Array> {
+  let remaining = 0;
+  const fail = (controller: ReadableStreamDefaultController, msg: string) => {
+    cleanup(); controller.error(new Error(msg));
+  };
+  return new ReadableStream({
+    async pull(controller) {
+      if (remaining === 0) {
+        const sizeLine = await br.readUntil(CRLF, 1024);
+        if (sizeLine === null) return fail(controller, "unexpected EOF reading chunk size");
+        const size = Number.parseInt(DEC.decode(sizeLine).split(";", 1)[0].trim(), 16);
+        if (!Number.isFinite(size) || size < 0) return fail(controller, "invalid chunk size");
+        if (size === 0) {
+          // Consume trailing headers
+          for (;;) {
+            const trailer = await br.readUntil(CRLF, MAX_HEADER_BYTES);
+            if (trailer === null || trailer.byteLength === 0) break;
+          }
+          controller.close(); cleanup(); return;
+        }
+        remaining = size;
+      }
+      const chunk = await br.readSome(remaining);
+      if (chunk === null) return fail(controller, "unexpected EOF in chunk data");
+      remaining -= chunk.byteLength;
+      controller.enqueue(chunk);
+      if (remaining === 0) {
+        const end = await br.readUntil(CRLF, 2);
+        if (end === null || end.byteLength !== 0) return fail(controller, "missing CRLF after chunk");
+      }
+    },
+    cancel: cleanup,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -291,22 +544,42 @@ async function buildRawRequest(
  * HTTP request that matches the associated policy rule.
  *
  * context carries Gateway request-phase selectors (src_ip, host, uri, etc.).
+ * next() is called on FAIL_OPEN when the proxy is unreachable before the
+ * request body was consumed, allowing Gateway's normal egress to take over.
  */
 export class GatewayMiddleware extends WorkerEntrypoint<Env> {
   async handle(
     request: Request,
     context: Record<string, unknown>,
-    // next is provided by Gateway but not used — this Worker is the egress.
-    _next: (req: Request) => Promise<Response>
+    next: (req: Request) => Promise<Response>
   ): Promise<Response> {
     const env = this.env;
     const requestId = newRequestId();
     const log = makeLogger(env, requestId);
+    const started = Date.now();
 
     log.info("GatewayMiddleware.handle() invoked");
     log.debug(`Gateway context: ${JSON.stringify(context)}`);
 
-    const url = new URL(request.url);
+    // Prefer context.uri (normalised by Gateway) over request.url where available
+    let url: URL;
+    try { url = new URL(request.url); } catch {
+      return new Response("Bad Request: invalid URL", { status: 400 });
+    }
+    if (context?.uri) {
+      try {
+        const normalized = new URL(context.uri as string);
+        if (normalized.protocol !== url.protocol) url.protocol = normalized.protocol;
+        if (normalized.host !== url.host) url.host = normalized.host;
+      } catch { /* ignore bad context.uri */ }
+    }
+
+    // WebSocket upgrades and unsupported schemes fall through to Gateway
+    if (request.headers.get("upgrade") || (url.protocol !== "https:" && url.protocol !== "http:")) {
+      log.info(`Passing through: upgrade=${request.headers.get("upgrade")} protocol=${url.protocol}`);
+      return next(request);
+    }
+
     const targetHost = url.hostname;
     const isHttps = url.protocol === "https:";
     const defaultPort = isHttps ? 443 : 80;
@@ -316,162 +589,60 @@ export class GatewayMiddleware extends WorkerEntrypoint<Env> {
     log.debug(`Full URL: ${url.toString()}`);
     log.debug(`Incoming headers: ${[...request.headers.entries()].map(([k, v]) => `${k}: ${v}`).join(", ")}`);
 
-    if (!targetHost) {
-      log.error("Missing host in request URL");
-      return new Response("Bad Request: missing host", { status: 400 });
-    }
-
-    // Build Proxy-Authorization header value if credentials are configured.
+    // Build Proxy-Authorization value if credentials are configured
     const proxyAuth = (env.PROXY_USERNAME && env.PROXY_PASSWORD)
       ? btoa(`${env.PROXY_USERNAME}:${env.PROXY_PASSWORD}`)
       : null;
     if (proxyAuth) log.debug("Proxy-Authorization header will be sent");
 
-    // Open a raw TCP connection to the proxy through the VPC tunnel.
+    const failOpen = String(env.FAIL_OPEN) === "true";
+
+    // Open a raw TCP connection to the proxy through the VPC tunnel
     log.debug(`Connecting to proxy at ${env.PROXY_HOST}:${env.PROXY_PORT} via VPC`);
-    let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array> };
+    let socket: { readable: ReadableStream<Uint8Array>; writable: WritableStream<Uint8Array>; close(): Promise<void> };
     try {
-      socket = await env.VPC.connect({
+      const raw = await env.VPC.connect({
         hostname: env.PROXY_HOST,
         port: parseInt(env.PROXY_PORT, 10),
       });
+      // Attach a no-op close so the shape matches what readResponse expects
+      socket = { ...raw, close: async () => {} };
       log.debug("VPC TCP connection established");
     } catch (err) {
       log.error(`VPC connect failed: ${err}`);
+      if (failOpen && !hasRequestBody(request)) {
+        log.info("FAIL_OPEN: falling through to Gateway egress");
+        return next(request);
+      }
       return new Response("Bad Gateway: could not connect to proxy", { status: 502 });
     }
 
-    const reader = new BufferedReader(socket.readable.getReader());
-    const writer = socket.writable.getWriter();
-
     try {
-      // Send an absolute-form request to the proxy for both HTTP and HTTPS.
-      //
-      // For HTTP:  GET http://host/path HTTP/1.1  — proxy forwards over HTTP.
-      // For HTTPS: GET https://host/path HTTP/1.1 — FortiGate's
-      //   detect-https-in-http-request detects the https:// scheme and opens
-      //   a TLS connection to the origin itself, returning the response to
-      //   the Worker over the plain proxy connection.
-      const rawRequest = await buildRawRequest(request, url, proxyAuth, log);
-      log.debug(`Writing ${rawRequest.length} bytes to proxy (${isHttps ? "HTTPS absolute-form" : "HTTP absolute-form"})`);
-      await writer.write(rawRequest);
+      // Send the HTTP request (headers + streamed body) into the proxy socket.
+      // sendRequest releases the writer lock when done, leaving the readable
+      // side available for readResponse.
+      const sendPromise = sendRequest(socket, request, url, proxyAuth, log).catch(err => {
+        log.error(`Request write failed: ${err}`);
+        socket.close().catch(() => {});
+      });
+      // Register the send as a background task so the runtime waits for it
+      // even after we start streaming the response back.
+      this.ctx.waitUntil(sendPromise);
 
-      const responseStream = reader.toReadableStream();
-      log.debug("Parsing HTTP response");
-      const response = await parseHttpResponse(responseStream, writer, log);
-      log.info(`Response: ${response.status} ${response.statusText}`);
+      const response = await readResponse(socket, request.method, log);
+      log.info(`Response: ${response.status} ${response.statusText} (${Date.now() - started}ms)`);
       return response;
     } catch (err) {
       log.error(`Proxy error: ${err}`);
-      try { writer.close(); } catch { /* ignore */ }
-      try { reader.cancel(); } catch { /* ignore */ }
-      return new Response(`Bad Gateway: ${(err as Error).message}`, { status: 502 });
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP/1.1 response parser
-// ---------------------------------------------------------------------------
-
-/**
- * Reads the HTTP/1.1 status line and headers from `stream`, then returns a
- * `Response` object with the parsed status/headers and the remaining body
- * as a streaming ReadableStream.
- */
-async function parseHttpResponse(
-  stream: ReadableStream<Uint8Array>,
-  writer: WritableStreamDefaultWriter<Uint8Array>,
-  log: Logger
-): Promise<Response> {
-  const CRLF2 = "\r\n\r\n";
-  const chunks: Uint8Array[] = [];
-  let headerText: string | null = null;
-  let bodyRemainder: Uint8Array | null = null;
-
-  const reader = stream.getReader();
-
-  while (headerText === null) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value as Uint8Array);
-
-    const soFar = concat(chunks);
-    const text = new TextDecoder("latin1").decode(soFar);
-    const sep = text.indexOf(CRLF2);
-    if (sep !== -1) {
-      headerText = text.substring(0, sep);
-      const bodyStart = sep + CRLF2.length;
-      if (bodyStart < soFar.length) {
-        bodyRemainder = soFar.subarray(bodyStart);
+      socket.close().catch(() => {});
+      if (failOpen && !hasRequestBody(request)) {
+        log.info("FAIL_OPEN: falling through to Gateway egress");
+        return next(request);
       }
+      return new Response(
+        `Bad Gateway: ${(err as Error).message}`,
+        { status: 502, headers: { "content-type": "text/plain; charset=utf-8" } }
+      );
     }
   }
-
-  if (!headerText) {
-    throw new Error("Proxy upstream closed connection before sending HTTP headers");
-  }
-
-  log.debug(`HTTP response headers:\n${headerText}`);
-
-  const lines = headerText.split("\r\n");
-  const statusLine = lines[0];
-  const statusMatch = statusLine.match(/^HTTP\/1\.[01] (\d{3})(?: (.*))?$/);
-  if (!statusMatch) {
-    throw new Error(`Unrecognised HTTP status line: ${statusLine}`);
-  }
-  const status = parseInt(statusMatch[1], 10);
-  const statusText = statusMatch[2] ?? "";
-
-  const responseHeaders = new Headers();
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    const colon = line.indexOf(":");
-    if (colon === -1) continue;
-    const name = line.substring(0, colon).trim().toLowerCase();
-    const value = line.substring(colon + 1).trim();
-    if (STRIP_RESPONSE.has(name)) {
-      log.debug(`Dropping response header: ${name}`);
-      continue;
-    }
-    responseHeaders.append(name, value);
-  }
-
-  log.debug(`Body remainder from header parse: ${bodyRemainder?.length ?? 0} bytes`);
-
-  const bodyStream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      if (bodyRemainder && bodyRemainder.length > 0) controller.enqueue(bodyRemainder);
-    },
-    async pull(controller) {
-      const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        try { writer.close(); } catch { /* ignore */ }
-      } else {
-        controller.enqueue(value as Uint8Array);
-      }
-    },
-    cancel() { reader.cancel(); },
-  });
-
-  const noBody = status === 204 || status === 304;
-
-  return new Response(noBody ? null : bodyStream, {
-    status,
-    statusText,
-    headers: responseHeaders,
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Utility
-// ---------------------------------------------------------------------------
-
-function concat(chunks: Uint8Array[]): Uint8Array {
-  const total = chunks.reduce((n, c) => n + c.length, 0);
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
-  return out;
 }

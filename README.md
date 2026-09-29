@@ -1,38 +1,67 @@
 # workers-proxy
 
-A Cloudflare Worker that acts as a forward HTTP proxy by tunneling requests through a SOCKS5 proxy on a private network, reachable via a [Workers VPC](https://developers.cloudflare.com/workers-vpc/) binding over a Cloudflare Tunnel.
+A Cloudflare Worker deployed as a **Gateway Custom Action** middleware that acts as a forward HTTP proxy, routing all traffic through a **FortiGate explicit web proxy** on a private network reachable via a [Workers VPC](https://developers.cloudflare.com/workers-vpc/) Network binding over a Cloudflare Tunnel.
 
-## Problem
-
-There is a SOCKS5 proxy running on a private LAN (`172.18.0.21:1080`) that can reach internal services not exposed to the public internet. Clients that need to route HTTP/HTTPS traffic through that proxy cannot reach it directly — it has no public address.
-
-## Solution
+## Architecture
 
 ```
 Client (HTTP/HTTPS)
-  │  TLS terminated at Cloudflare edge
+  │  TLS terminated at Cloudflare Gateway edge
   ▼
-Cloudflare Worker  (workers-proxy)
+Cloudflare Gateway
+  │  HTTP policy match → Custom Action
+  ▼
+GatewayMiddleware.handle()   [this Worker]
   │  Plaintext TCP via Workers VPC Network binding
   ▼
 Cloudflare Tunnel  (mad01-k8s)
   │  Private LAN
   ▼
-SOCKS5 proxy  (172.18.0.21:1080)
-  │
+FortiGate explicit web proxy  (172.18.0.22:8888)
+  │  HTTP:  forwards to origin over plain HTTP
+  │  HTTPS: detect-https-in-http-request → TLS to origin
   ▼
 Target origin
 ```
 
-The Worker:
+Gateway terminates the client's TLS before dispatching to the Worker. The Worker receives a plain, decrypted `Request` for both HTTP and HTTPS destinations. It forwards this as an absolute-form HTTP proxy request to FortiGate, which handles the outbound TLS to HTTPS origins.
 
-1. Receives every inbound request as a plain `Request` object (Cloudflare terminates TLS at the edge).
-2. Opens a raw TCP socket to the SOCKS5 proxy through a **Workers VPC Network** binding, which routes the connection through a Cloudflare Tunnel into the private network.
-3. Performs the full **SOCKS5 CONNECT handshake** (RFC 1928) with **username/password authentication** (RFC 1929).
-4. Serialises the incoming HTTP request and writes it into the now-transparent tunnel.
-5. Parses the raw HTTP/1.1 response from the socket and streams it back to the client.
+## Protocol
 
-Because Cloudflare terminates TLS before the Worker runs, HTTPS clients are handled identically to HTTP clients — the Worker sees a plain, decrypted `Request` in both cases.
+Both HTTP and HTTPS use the same request format — absolute-form URL in the request line:
+
+```
+GET http://example.com/path HTTP/1.1
+GET https://example.com/path HTTP/1.1
+```
+
+The FortiGate explicit proxy handles each differently:
+
+- **HTTP** — forwards the request to the origin over plain HTTP.
+- **HTTPS** — the `detect-https-in-http-request` feature detects the `https://` scheme and opens a TLS connection to the origin itself, returning the decrypted response to the Worker over the plain proxy connection.
+
+This avoids the need for the Worker to speak TLS, which is not possible via `env.VPC.connect()` (plaintext TCP only).
+
+## Required FortiGate configuration
+
+```
+config web-proxy explicit
+    set status enable
+    set http-incoming-port 8888
+end
+
+config firewall proxy-policy
+    edit <policy-id>
+        set proxy explicit-web
+        set action accept
+        set detect-https-in-http-request enable
+        set ssl-ssh-profile "deep-inspection"
+        set logtraffic all
+    next
+end
+```
+
+`detect-https-in-http-request` and `ssl-ssh-profile "deep-inspection"` are mandatory for HTTPS proxying.
 
 ## Configuration
 
@@ -40,20 +69,23 @@ Because Cloudflare terminates TLS before the Worker runs, HTTPS clients are hand
 
 | Variable | Description | Default |
 |---|---|---|
-| `SOCKS5_HOST` | Hostname or IP of the SOCKS5 proxy | `172.18.0.21` |
-| `SOCKS5_PORT` | Port of the SOCKS5 proxy | `1080` |
+| `PROXY_HOST` | Hostname or IP of the FortiGate explicit proxy | `172.18.0.22` |
+| `PROXY_PORT` | Port the proxy listens on | `8888` |
+| `FAIL_OPEN` | When `"true"`, falls through to Gateway's normal egress if the proxy is unreachable (and the request body was not yet consumed) instead of returning 502 | `"false"` |
 | `DEBUG` | Set to `"true"` to enable verbose per-request logging | `"true"` |
 
 ### Secrets (encrypted, set via `wrangler secret put`)
 
 | Secret | Description |
 |---|---|
-| `SOCKS5_USERNAME` | RFC 1929 username for SOCKS5 authentication |
-| `SOCKS5_PASSWORD` | RFC 1929 password for SOCKS5 authentication |
+| `PROXY_USERNAME` | HTTP proxy username (Proxy-Authorization: Basic) |
+| `PROXY_PASSWORD` | HTTP proxy password |
+
+Credentials are optional. If absent, requests are sent without a `Proxy-Authorization` header.
 
 ### Workers VPC Network binding (`wrangler.jsonc` → `vpc_networks`)
 
-The binding named `VPC` is pointed at the `mad01-k8s` Cloudflare Tunnel (`9ab52e82-7276-43c3-8acc-7a5e99556e9f`). Any `connect()` call on this binding is routed through that tunnel into the private network.
+The binding named `VPC` is pointed at the `mad01-k8s` Cloudflare Tunnel (`9ab52e82-7276-43c3-8acc-7a5e99556e9f`). Any `connect()` call on this binding is routed through that tunnel into the private network where the FortiGate proxy is reachable.
 
 ## Deployment
 
@@ -61,9 +93,9 @@ The binding named `VPC` is pointed at the `mad01-k8s` Cloudflare Tunnel (`9ab52e
 # Install dependencies
 npm install
 
-# Set credentials (interactive prompts — values are never echoed)
-wrangler secret put SOCKS5_USERNAME
-wrangler secret put SOCKS5_PASSWORD
+# Optional: set proxy credentials
+printf 'myuser' | wrangler secret put PROXY_USERNAME
+printf 'mypass' | wrangler secret put PROXY_PASSWORD
 
 # Deploy
 wrangler deploy
@@ -72,73 +104,99 @@ wrangler deploy
 ## Development
 
 ```bash
-# Local dev server (note: VPC Network binding requires remote: true)
-npm run dev
-
-# Stream live logs from the deployed worker
-npm run logs
-
-# Type-check without deploying
-npm run typecheck
+npm run dev        # wrangler dev (VPC binding requires remote: true)
+npm run logs       # wrangler tail — live log stream
+npm run typecheck  # tsc --noEmit
+npm run deploy     # wrangler deploy
 ```
-
-## Usage
-
-Point any HTTP client's proxy at the Worker URL:
-
-```bash
-# Explicit proxy flag
-curl -x https://workers-proxy.massesos.workers.dev http://internal.example.com/api
-
-# Via environment variables (most tools and runtimes honour these)
-export http_proxy=https://workers-proxy.massesos.workers.dev
-export https_proxy=https://workers-proxy.massesos.workers.dev
-curl http://internal.example.com/api
-```
-
-## SOCKS5 handshake
-
-The Worker implements the full protocol:
-
-```
-Worker → Proxy:  05 02 00 02          (VER=5, NMETHODS=2, no-auth + user/pass)
-Proxy  → Worker: 05 02                (VER=5, METHOD=user/pass chosen)
-
-Worker → Proxy:  01 <ulen> <user> <plen> <pass>   (RFC 1929 sub-negotiation)
-Proxy  → Worker: 01 00                             (success)
-
-Worker → Proxy:  05 01 00 03 <hlen> <host> <port>  (CONNECT host:port)
-Proxy  → Worker: 05 00 00 ...                       (success + BND address)
-
--- tunnel is now a transparent byte pipe --
-```
-
-Both `0x00` (no-auth) and `0x02` (user/pass) are advertised in the greeting. If the proxy selects no-auth the RFC 1929 exchange is skipped.
 
 ## Logging
 
 When `DEBUG=true`, every request produces structured log lines prefixed with a short random request ID (e.g. `[A3X9KQ]`):
 
 ```
-[A3X9KQ] [INFO]  GET example.com:80
-[A3X9KQ] [DEBUG] Connecting to SOCKS5 proxy at 172.18.0.21:1080 via VPC
-[A3X9KQ] [DEBUG] SOCKS5 greeting → 05 02 00 02
-[A3X9KQ] [DEBUG] SOCKS5 method selection ← 05 02
-[A3X9KQ] [DEBUG] SOCKS5 auth sub-negotiation → VER=0x01 ULEN=4 PLEN=4
-[A3X9KQ] [DEBUG] SOCKS5 auth reply ← 01 00
-[A3X9KQ] [DEBUG] SOCKS5 authentication succeeded
-[A3X9KQ] [DEBUG] SOCKS5 CONNECT → example.com:80
-[A3X9KQ] [DEBUG] SOCKS5 tunnel established
-[A3X9KQ] [INFO]  Response: 200 OK
+[A3X9KQ] [INFO]  GatewayMiddleware.handle() invoked
+[A3X9KQ] [DEBUG] Gateway context: {"src_ip":"...","host":"example.com",...}
+[A3X9KQ] [INFO]  GET example.com:443
+[A3X9KQ] [DEBUG] Connecting to proxy at 172.18.0.22:8888 via VPC
+[A3X9KQ] [DEBUG] VPC TCP connection established
+[A3X9KQ] [DEBUG] Request line: GET https://example.com/path HTTP/1.1
+[A3X9KQ] [DEBUG] Response status: 200 OK
+[A3X9KQ] [DEBUG] Response body: chunked transfer-encoding
+[A3X9KQ] [INFO]  Response: 200 OK (142ms)
 ```
 
-Credentials are never logged — only the field lengths (`ULEN`, `PLEN`) appear in debug output.
+`log.error()` always emits regardless of `DEBUG`. Credentials are never logged.
 
-Errors are always logged regardless of `DEBUG`.
+## Request body handling
+
+Request bodies are streamed rather than buffered:
+
+- If `Content-Length` is known, the body is forwarded verbatim.
+- If `Content-Length` is absent (e.g. streaming POST), the body is forwarded as `Transfer-Encoding: chunked` — no buffering in Worker memory.
+
+## Response body handling
+
+The Worker correctly handles all three HTTP/1.1 body framing modes:
+
+| Mode | Detection | Handling |
+|---|---|---|
+| Chunked | `Transfer-Encoding: chunked` | Full chunk decoder — reads size lines, validates CRLF, decodes trailers |
+| Fixed-length | `Content-Length: N` | Exactly N bytes via `FixedLengthStream` |
+| Until-close | Neither header | Streams until socket EOF |
+
+`Content-Encoding` and `Content-Length` are stripped from responses because Gateway may have already decoded the body before dispatching to the Worker.
+
+## FAIL_OPEN mode
+
+When `FAIL_OPEN=true`, if the proxy TCP connection fails *before* the request body is consumed, the Worker calls `next(request)` to let Gateway handle the request through its normal egress path. This prevents a proxy outage from hard-blocking all traffic.
+
+When the request body has already been partially read (e.g. a large upload mid-stream), FAIL_OPEN is not attempted — the body cannot be replayed.
+
+## Cloudflare header stripping
+
+The following Cloudflare-internal headers are stripped before forwarding to the proxy, because Cloudflare-fronted origins reject requests that carry them (403):
+
+`cf-connecting-ip`, `cf-connecting-ipv6`, `cf-ipcountry`, `cf-ray`, `cf-visitor`, `cf-worker`, `cf-ew-via`, `cdn-loop`, `x-real-ip`
+
+## Proxy compatibility
+
+The Worker sends `GET https://host/path HTTP/1.1` (absolute-form with `https://` scheme) for HTTPS destinations. Not all HTTP proxies support this.
+
+### FortiGate explicit web proxy ✓
+
+Supported via `detect-https-in-http-request`. See [Required FortiGate configuration](#required-fortigate-configuration) above.
+
+### Squid ✓
+
+Squid supports absolute-form HTTPS requests natively in forward proxy mode. No special configuration is needed beyond enabling the proxy and allowing the relevant ACLs:
+
+```
+# /etc/squid/squid.conf (minimal)
+http_port 3128
+
+# Allow connections from the Worker's egress IP (the tunnel exit node)
+acl worker_src src 172.18.0.0/24
+http_access allow worker_src
+
+# Allow HTTPS destinations via absolute-form (default behaviour)
+http_access deny all
+```
+
+Squid will issue its own TLS connection to the origin when it sees an `https://` request target, returning the decrypted response to the Worker over the plain proxy connection — exactly the same behaviour as FortiGate with `detect-https-in-http-request`.
+
+### tinyproxy ✗ — not compatible
+
+Tinyproxy will not work with this Worker. By design, tinyproxy is a lightweight HTTP proxy that treats HTTPS traffic strictly as an opaque stream via the `CONNECT` method. When it receives `GET https://host/path HTTP/1.1` in absolute-form, it returns `501 Not Implemented` — it has no capability to fetch HTTPS resources itself. The source code confirms this: only `http://` URLs and `CONNECT` requests are handled; everything else falls into a `501` branch.
+
+The `CONNECT`-based approach (which tinyproxy does support) cannot be used here because `env.VPC.connect()` is plaintext-only and `startTls()` is not available on VPC-bound sockets.
 
 ## Known limitations
 
-- **No worker-level authentication**: any client that can reach the Worker URL can use it as a proxy. Place it behind [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/) if unauthenticated access is a concern.
-- **Chunked Transfer-Encoding**: response bodies are streamed verbatim from the socket, so chunked framing bytes are forwarded as-is. Add a `TransformStream` to decode them if this causes issues with specific clients.
-- **One connection per request**: the Workers runtime does not allow socket reuse across requests, so a new SOCKS5 connection is opened for every inbound request.
-- **Plaintext Worker-to-proxy leg**: `connect()` over VPC Networks currently supports plaintext TCP only. This is acceptable because the tunnel runs over the trusted private LAN; the public leg (client-to-Worker) is always HTTPS.
+- **One connection per request** — the Workers runtime ties TCP socket lifetimes to request lifetimes. A new proxy connection is opened for every inbound request; there is no connection pool.
+- **WebSocket upgrades** — requests with an `Upgrade` header are passed through to Gateway's normal egress via `next()` and are not proxied.
+- **Plaintext Worker-to-proxy leg** — `env.VPC.connect()` supports plaintext TCP only. This is acceptable because the FortiGate proxy is on a trusted private LAN and handles the HTTPS leg to the origin itself.
+
+## Credits
+
+This implementation is based on the work of **Marcos Pryce-Jones** (marcos@cloudflare.com), whose production-grade Gateway middleware Worker established the key patterns used here: absolute-form proxy protocol for both HTTP and HTTPS, streaming chunked request bodies, correct three-mode response body framing (chunked / fixed-length / until-close), Cloudflare header stripping, and FAIL_OPEN graceful degradation.
