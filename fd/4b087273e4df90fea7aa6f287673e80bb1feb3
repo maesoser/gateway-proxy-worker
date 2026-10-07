@@ -1,0 +1,32 @@
+src/index.ts
+  s_18f09c288fdec1::t_874ad970c0aa26 115
+  s_18f09c288fdec1::t_ec0ef79fc312c9 60-65,67,71
+  s_18f09c288fdec1::t_26d0dfabdf626f 2
+  s_18f09c288fdec1::t_ca0a0ffd7861ca 104,107,109
+  s_18f09c288fdec1::t_1bb64f7e33147c 66,75-76,82
+package.json
+  s_18f09c288fdec1::t_71e5880042ef7f 2
+worker-configuration.d.ts
+  s_18f09c288fdec1::t_04e87272d10142 2,8
+  s_18f09c288fdec1::t_2eb77c122d6de5 6-7,9,22
+wrangler.jsonc
+  s_18f09c288fdec1::t_e1aeeb3656e3b3 3
+  s_18f09c288fdec1::t_4262cfc8fd6ba4 20
+  s_18f09c288fdec1::t_22c57be78fd54b 32-40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fd4b087273e4df90fea7aa6f287673e80bb1feb3",
+  "prompts": {},
+  "sessions": {
+    "s_18f09c288fdec1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eea0c0489ffeXF9NprLKJF01hp",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "Sergio Maeso <sergio@cloudflare.com>"
+    }
+  }
+}
