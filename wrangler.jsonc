@@ -4,19 +4,19 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-09-28",
 
-  // VPC Network binding — routes connect() calls through the mad01-k8s Cloudflare Tunnel
+  // VPC Network binding — routes connect() calls through a Cloudflare Tunnel
   "vpc_networks": [
     {
       "binding": "VPC",
-      "tunnel_id": "9ab52e82-7276-43c3-8acc-7a5e99556e9f",
+      "tunnel_id": "YOUR-TUNNEL-ID",
       "remote": true
     }
   ],
 
   // HTTP proxy address reachable behind the tunnel
   "vars": {
-    "PROXY_HOST": "172.18.0.22",
-    "PROXY_PORT": "8888",
+    "PROXY_HOST": "YOUR-PROXY-HOST",
+    "PROXY_PORT": "YOUR-PROXY-PORT",
     "DEBUG": "false",
     // When "true": if the proxy is unreachable before the request body is consumed,
     // the request falls through to Gateway's normal egress instead of returning 502.

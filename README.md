@@ -1,4 +1,4 @@
-# workers-proxy
+# gateway-proxy-worker
 
 A Cloudflare Worker deployed as a **Gateway Custom Action** middleware that acts as a forward HTTP proxy, routing all traffic through an HTTP proxy on a private network reachable via a [Workers VPC](https://developers.cloudflare.com/workers-vpc/) Network binding over a Cloudflare Tunnel.
 
@@ -14,10 +14,10 @@ Cloudflare Gateway
 GatewayMiddleware.handle()   [this Worker]
   │  Plaintext TCP via Workers VPC Network binding
   ▼
-Cloudflare Tunnel  (mad01-k8s)
+Cloudflare Tunnel
   │  Private LAN
   ▼
-HTTP proxy  (172.18.0.22:8888)
+HTTP proxy  (<PROXY_HOST>:<PROXY_PORT>)
   │  HTTP:  forwards to origin over plain HTTP
   │  HTTPS: proxy opens TLS to origin on behalf of the Worker
   ▼
@@ -78,7 +78,7 @@ Squid supports absolute-form HTTPS requests natively in forward proxy mode. No s
 http_port 3128
 
 # Allow connections from the Worker's egress IP (the tunnel exit node)
-acl worker_src src 172.18.0.0/24
+acl worker_src src <your-tunnel-egress-subnet>
 http_access allow worker_src
 http_access deny all
 ```
@@ -97,10 +97,10 @@ The `CONNECT`-based approach (which tinyproxy does support) cannot be used here 
 
 | Variable | Description | Default |
 |---|---|---|
-| `PROXY_HOST` | Hostname or IP of the HTTP proxy reachable behind the tunnel | `172.18.0.22` |
-| `PROXY_PORT` | Port the proxy listens on | `8888` |
+| `PROXY_HOST` | Hostname or IP of the HTTP proxy reachable behind the tunnel | — |
+| `PROXY_PORT` | Port the proxy listens on | — |
 | `FAIL_OPEN` | When `"true"`, falls through to Gateway's normal egress if the proxy is unreachable (and the request body was not yet consumed) instead of returning 502 | `"false"` |
-| `DEBUG` | Set to `"true"` to enable verbose per-request logging | `"true"` |
+| `DEBUG` | Set to `"true"` to enable verbose per-request logging | `"false"` |
 
 ### Secrets (encrypted, set via `wrangler secret put`)
 
@@ -113,13 +113,17 @@ Credentials are optional. If absent, requests are sent without a `Proxy-Authoriz
 
 ### Workers VPC Network binding (`wrangler.jsonc` → `vpc_networks`)
 
-The binding named `VPC` is pointed at the `mad01-k8s` Cloudflare Tunnel (`9ab52e82-7276-43c3-8acc-7a5e99556e9f`). Any `connect()` call on this binding is routed through that tunnel into the private network where the proxy is reachable.
+The binding named `VPC` must be pointed at a Cloudflare Tunnel that has access to the private network where the proxy is reachable. Update `tunnel_id` in `wrangler.jsonc` with your tunnel's ID before deploying.
 
 ## Deployment
 
 ```bash
 # Install dependencies
 npm install
+
+# Set the proxy address
+# Edit wrangler.jsonc: set PROXY_HOST and PROXY_PORT under vars
+# Edit wrangler.jsonc: set tunnel_id under vpc_networks
 
 # Optional: set proxy credentials
 printf 'myuser' | wrangler secret put PROXY_USERNAME
@@ -140,18 +144,18 @@ npm run deploy     # wrangler deploy
 
 ## Logging
 
-When `DEBUG=true`, every request produces structured log lines prefixed with a short random request ID (e.g. `[A3X9KQ]`):
+When `DEBUG=true`, every request produces structured JSON log lines, each tagged with a short random request ID:
 
-```
-[A3X9KQ] [INFO]  GatewayMiddleware.handle() invoked
-[A3X9KQ] [DEBUG] Gateway context: {"src_ip":"...","host":"example.com",...}
-[A3X9KQ] [INFO]  GET example.com:443
-[A3X9KQ] [DEBUG] Connecting to proxy at 172.18.0.22:8888 via VPC
-[A3X9KQ] [DEBUG] VPC TCP connection established
-[A3X9KQ] [DEBUG] Request line: GET https://example.com/path HTTP/1.1
-[A3X9KQ] [DEBUG] Response status: 200 OK
-[A3X9KQ] [DEBUG] Response body: chunked transfer-encoding
-[A3X9KQ] [INFO]  Response: 200 OK (142ms)
+```json
+{"level":"INFO","requestId":"A3X9KQ12","msg":"GatewayMiddleware.handle() invoked"}
+{"level":"DEBUG","requestId":"A3X9KQ12","msg":"Gateway context: {\"src_ip\":\"...\",\"host\":\"example.com\",...}"}
+{"level":"INFO","requestId":"A3X9KQ12","msg":"GET example.com:443"}
+{"level":"DEBUG","requestId":"A3X9KQ12","msg":"Connecting to proxy at <PROXY_HOST>:<PROXY_PORT> via VPC"}
+{"level":"DEBUG","requestId":"A3X9KQ12","msg":"VPC TCP connection established"}
+{"level":"DEBUG","requestId":"A3X9KQ12","msg":"Request line: GET https://example.com/path HTTP/1.1"}
+{"level":"DEBUG","requestId":"A3X9KQ12","msg":"Response status: 200 OK"}
+{"level":"DEBUG","requestId":"A3X9KQ12","msg":"Response body: chunked transfer-encoding"}
+{"level":"INFO","requestId":"A3X9KQ12","msg":"Response: 200 OK (142ms)"}
 ```
 
 `log.error()` always emits regardless of `DEBUG`. Credentials are never logged.
@@ -192,7 +196,3 @@ The following Cloudflare-internal headers are stripped before forwarding to the 
 - **One connection per request** — the Workers runtime ties TCP socket lifetimes to request lifetimes. A new proxy connection is opened for every inbound request; there is no connection pool.
 - **WebSocket upgrades** — requests with an `Upgrade` header are passed through to Gateway's normal egress via `next()` and are not proxied.
 - **Plaintext Worker-to-proxy leg** — `env.VPC.connect()` supports plaintext TCP only. This is acceptable because the proxy is on a trusted private LAN and handles the HTTPS leg to the origin itself.
-
-## Credits
-
-This implementation is based on the work of **Marcos Pryce-Jones** (marcos@cloudflare.com), whose production-grade Gateway middleware Worker established the key patterns used here: absolute-form proxy protocol for both HTTP and HTTPS, streaming chunked request bodies, correct three-mode response body framing (chunked / fixed-length / until-close), Cloudflare header stripping, and FAIL_OPEN graceful degradation.
