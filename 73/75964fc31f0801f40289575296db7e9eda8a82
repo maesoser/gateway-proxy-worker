@@ -1,0 +1,21 @@
+README.md
+  s_18f09c288fdec1::t_279ec17c5a65b2 1,17,20,81,100-101,103,116,124-127,147-158
+wrangler.jsonc
+  s_18f09c288fdec1::t_3f4ef623b95cba 7,11,18-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7375964fc31f0801f40289575296db7e9eda8a82",
+  "prompts": {},
+  "sessions": {
+    "s_18f09c288fdec1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_eea0c0489ffeXF9NprLKJF01hp",
+        "model": "claude-sonnet-4-6"
+      },
+      "human_author": "Sergio Maeso <sergio@cloudflare.com>"
+    }
+  }
+}
